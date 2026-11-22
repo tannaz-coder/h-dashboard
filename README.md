@@ -2,6 +2,17 @@
 
 > 🏥 Hospital/healthcare center hardware inventory, organizational units, tickets, and analytics dashboard.
 
+## 🎬 Teaser
+
+30-second Persian teaser for h-dashboard — hospital equipment, live GIS map and tickets, in three 10-second clips:
+
+- 🎬 Clip 1 — The problem: https://www.instagram.com/reel/Df-QJ0ADtH7/
+- 🗺️ Clip 2 — Dashboard, GIS map and tickets: https://www.instagram.com/reel/Df-NX3RDtIO/
+- 🔗 Clip 3 — Project name and GitHub link: https://www.instagram.com/reel/Df-QaU8jq0u/
+
+📸 Instagram: [@nahid.saeedi68](https://www.instagram.com/nahid.saeedi68/)
+💻 Fork: https://github.com/tannaz-coder/h-dashboard
+
 [![Tests](https://github.com/asgarimehdi/h-dashboard/actions/workflows/test.yml/badge.svg)](https://github.com/asgarimehdi/h-dashboard/actions/workflows/test.yml)
 
 ## English
