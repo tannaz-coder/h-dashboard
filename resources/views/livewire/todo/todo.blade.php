@@ -245,10 +245,30 @@ return new class extends Component
             return;
         }
 
-        $todo->update([
-            'start_at' => $startDate,
-            'end_at' => $endDate ?? $startDate,
-        ]);
+        // #1659: FullCalendar sends `endStr === ''` for an event with no end.
+        // `'' ?? $startDate` is still '' and Eloquent's datetime cast parses ''
+        // as now(), so blank must be normalised to null BEFORE the range is
+        // resolved — otherwise this path itself can store end < start.
+        $endDate = $endDate !== null && trim($endDate) !== '' ? $endDate : null;
+
+        try {
+            $start = Carbon::parse($startDate);
+            $end = $endDate !== null ? Carbon::parse($endDate) : $start;
+        } catch (\Exception) {
+            $this->dispatch('swal', ['title' => 'تاریخ واردشده معتبر نیست.', 'icon' => 'error']);
+            $this->dispatch('calendar-updated', events: $this->getEvents());
+
+            return;
+        }
+
+        if ($end->lt($start)) {
+            $this->dispatch('swal', ['title' => 'تاریخ پایان نمی‌تواند قبل از تاریخ شروع باشد.', 'icon' => 'error']);
+            $this->dispatch('calendar-updated', events: $this->getEvents());
+
+            return;
+        }
+
+        $todo->update(['start_at' => $start, 'end_at' => $end]);
 
         app(CacheInvalidationServiceInterface::class)->increment('calendar');
 
@@ -302,8 +322,11 @@ return new class extends Component
         $this->authorize('calendar');
 
         $this->validate([
-            'title' => 'required|min:3',
-            'start_date_picker' => 'required',
+            'title' => 'required|string|min:3|max:255',
+            'start_date_picker' => ['required', 'string', $this->jalaliDateRule()],
+            'end_date_picker' => ['nullable', 'string', $this->jalaliDateRule()],
+            'start_time_picker' => ['nullable', 'string', 'date_format:H:i'],
+            'end_time_picker' => ['nullable', 'string', 'date_format:H:i'],
         ]);
 
         // Validate unit_id is accessible
@@ -335,13 +358,29 @@ return new class extends Component
             }
         }
 
-        $startDateTime = $this->start_date_picker.' '.($this->start_time_picker ?: '00:00');
-        $startMildadi = $this->convertToMiladi($startDateTime);
+        $startMildadi = $this->convertToMiladi($this->start_date_picker, $this->start_time_picker);
+
+        if ($startMildadi === null) {
+            $this->addError('start_date_picker', 'تاریخ واردشده معتبر نیست.');
+
+            return;
+        }
 
         $endMildadi = null;
         if ($this->end_date_picker) {
-            $endDateTime = $this->end_date_picker.' '.($this->end_time_picker ?: '00:00');
-            $endMildadi = $this->convertToMiladi($endDateTime);
+            $endMildadi = $this->convertToMiladi($this->end_date_picker, $this->end_time_picker);
+
+            if ($endMildadi === null) {
+                $this->addError('end_date_picker', 'تاریخ واردشده معتبر نیست.');
+
+                return;
+            }
+        }
+
+        if ($endMildadi !== null && $endMildadi->lt($startMildadi)) {
+            $this->addError('end_date_picker', 'تاریخ پایان نمی‌تواند قبل از تاریخ شروع باشد.');
+
+            return;
         }
 
         $todo = Todo::updateOrCreate(
@@ -368,22 +407,48 @@ return new class extends Component
         $this->dispatch('calendar-updated', events: $this->getEvents());
     }
 
-    private function convertToMiladi($jalaliDate)
+    /**
+     * Strict Jalali `Y/m/d` rule for the pickers (issue #1655).
+     *
+     * The inputs are readonly pickers, but Livewire properties are
+     * server-trusted, so `/livewire/update` can carry an impossible date.
+     * `parseStrict()` rejects it instead of letting morilog normalise it.
+     * Empty values pass — `end_date_picker` is optional.
+     */
+    private function jalaliDateRule(): \Closure
     {
-        $parts = explode(' ', $jalaliDate);
-        $dateParts = explode('/', $parts[0]);
-        $timeParts = isset($parts[1]) ? explode(':', $parts[1]) : [0, 0];
+        return static function (string $attribute, mixed $value, \Closure $fail): void {
+            if (! is_string($value) || trim($value) === '') {
+                return;
+            }
 
-        $jalalian = new Jalalian(
-            (int) $dateParts[0],
-            (int) $dateParts[1],
-            (int) $dateParts[2],
-            (int) $timeParts[0],
-            (int) $timeParts[1],
-            0
-        );
+            if (\App\Support\JalaliDateRange::parseStrict($value) === null) {
+                $fail('تاریخ واردشده معتبر نیست.');
+            }
+        };
+    }
 
-        return $jalalian->toCarbon();
+    private function convertToMiladi(mixed $date, mixed $time): ?Carbon
+    {
+        if (! is_string($date)) {
+            return null;
+        }
+
+        $parsed = \App\Support\JalaliDateRange::parseStrict($date);
+
+        if ($parsed === null) {
+            return null;
+        }
+
+        $time = is_string($time) && $time !== '' ? $time : '00:00';
+
+        if (preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', $time) !== 1) {
+            return null;
+        }
+
+        [$hour, $minute] = array_map('intval', explode(':', $time));
+
+        return $parsed->setTime($hour, $minute);
     }
 
     /**
@@ -563,7 +628,7 @@ return new class extends Component
 
     <x-modal wire:model="modal" title="جزئیات تسک" separator>
         <x-form wire:submit="save">
-            <x-input label="عنوان فعالیت" wire:model="title" placeholder="مثلاً: جلسه فنی" />
+            <x-input label="عنوان فعالیت" wire:model="title" placeholder="مثلاً: جلسه فنی" maxlength="255" />
 
             <div class="space-y-4">
                 <div class="form-control">

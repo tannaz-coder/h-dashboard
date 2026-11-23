@@ -144,7 +144,7 @@ new class extends Component
                 },
             ],
             'subject' => 'required|string|min:5|max:255',
-            'content' => 'required|string|min:10',
+            'content' => 'required|string|min:10|max:20000',
             // #847: priority was also unvalidated, so the web form stored
             // values (`medium`, `high`) the CHECK constraint allows but the
             // picker and the API both refuse — and anything outside the set
@@ -221,6 +221,7 @@ new class extends Component
                         'end_at' => now()->addWeek(),
                         'is_completed' => false,
                         'unit_id' => $destinationInScope ? $this->unit_id : session('current_unit_id', auth()->user()->person?->u_id),
+                        'user_id' => auth()->id(),
                     ]);
                     $ticket->update(['task_id' => $todo->id]);
                 }
@@ -334,7 +335,8 @@ new class extends Component
                     label="شرح درخواست"
                     wire:model="content"
                     placeholder="جزئیات مشکل خود را اینجا بنویسید..."
-                    rows="4" />
+                    rows="4"
+                    maxlength="20000" />
             </div>
 
             @if(count($todos) > 0)

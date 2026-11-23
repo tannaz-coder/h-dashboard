@@ -205,6 +205,97 @@ test('create todo requires start_date_picker', function () {
         ->assertHasErrors(['start_date_picker']);
 });
 
+// Issue #1655: Livewire properties are server-trusted, so the date pickers
+// must be validated strictly instead of relying on the readonly picker UI.
+test('create todo rejects an impossible start date (Aban 31)', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('openModal')
+        ->set('title', 'وظیفه تستی')
+        ->set('start_date_picker', '1404/08/31')
+        ->set('start_time_picker', '09:00')
+        ->call('save')
+        ->assertHasErrors(['start_date_picker']);
+
+    $this->assertDatabaseCount('todos', 0);
+});
+
+test('create todo rejects month 13', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('openModal')
+        ->set('title', 'وظیفه تستی')
+        ->set('start_date_picker', '1404/13/01')
+        ->set('start_time_picker', '09:00')
+        ->call('save')
+        ->assertHasErrors(['start_date_picker']);
+
+    $this->assertDatabaseCount('todos', 0);
+});
+
+test('create todo rejects an impossible end date', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('openModal')
+        ->set('title', 'وظیفه تستی')
+        ->set('start_date_picker', '1405/07/01')
+        ->set('start_time_picker', '09:00')
+        ->set('end_date_picker', '1404/08/31')
+        ->call('save')
+        ->assertHasErrors(['end_date_picker']);
+
+    $this->assertDatabaseCount('todos', 0);
+});
+
+test('create todo rejects an impossible time', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('openModal')
+        ->set('title', 'وظیفه تستی')
+        ->set('start_date_picker', '1405/07/01')
+        ->set('start_time_picker', '25:99')
+        ->call('save')
+        ->assertHasErrors(['start_time_picker']);
+
+    $this->assertDatabaseCount('todos', 0);
+});
+
+test('create todo stores the expected Gregorian start_at', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('openModal')
+        ->set('title', 'وظیفه تستی')
+        ->set('start_date_picker', '1405/07/01')
+        ->set('start_time_picker', '10:30')
+        ->call('save')
+        ->assertHasNoErrors();
+
+    $todo = Todo::query()->where('title', 'وظیفه تستی')->firstOrFail();
+
+    expect($todo->start_at->format('Y-m-d H:i'))->toBe('2026-09-23 10:30');
+});
+
+test('create todo accepts the 31st of Shahrivar', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('openModal')
+        ->set('title', 'وظیفه تستی')
+        ->set('start_date_picker', '1404/06/31')
+        ->set('start_time_picker', '10:30')
+        ->call('save')
+        ->assertHasNoErrors();
+
+    $todo = Todo::query()->where('title', 'وظیفه تستی')->firstOrFail();
+
+    expect($todo->start_at->format('Y-m-d H:i'))->toBe('2025-09-22 10:30');
+});
+
 // ==================== Edit Todo ====================
 
 test('can edit a todo', function () {
@@ -237,6 +328,27 @@ test('edit saves changes', function () {
         ->call('save');
 
     $this->assertDatabaseHas('todos', ['id' => $todo->id, 'title' => 'عنوان جدید']);
+});
+
+test('edit with an impossible date leaves the stored row unchanged', function () {
+    $this->actingAs($this->user);
+
+    $todo = Todo::factory()->create([
+        'unit_id' => $this->unit->id,
+        'title' => 'عنوان قبل',
+        'start_at' => '2026-01-01 08:00:00',
+    ]);
+
+    Livewire::test('todo.todo')
+        ->call('editEvent', $todo->id)
+        ->set('start_date_picker', '1404/08/31')
+        ->call('save')
+        ->assertHasErrors(['start_date_picker']);
+
+    $this->assertDatabaseHas('todos', [
+        'id' => $todo->id,
+        'start_at' => '2026-01-01 08:00:00',
+    ]);
 });
 
 test('editing a todo preserves the original owner', function () {
@@ -1033,4 +1145,233 @@ test('dead guard property hasPubliclyVisibleDates is absent from the codebase', 
 
     // The property should not appear anywhere in the file
     expect($view)->not->toContain('hasPubliclyVisibleDates');
+});
+
+// #1658: `title` had no upper bound on the Livewire write path, so an
+// over-long title reached the varchar(255) column and failed with a 500
+// instead of a validation error. The cap is exactly the column width.
+test('create todo rejects title above max length', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('openModal')
+        ->set('title', str_repeat('ا', 256))
+        ->set('start_date_picker', '1405/07/01')
+        ->call('save')
+        ->assertHasErrors(['title']);
+
+    $this->assertDatabaseCount('todos', 0);
+});
+
+test('create todo accepts title at exactly max length', function () {
+    $this->actingAs($this->user);
+    $title = str_repeat('ا', 255);
+
+    Livewire::test('todo.todo')
+        ->call('openModal')
+        ->set('title', $title)
+        ->set('start_date_picker', '1405/07/01')
+        ->call('save')
+        ->assertHasNoErrors();
+
+    $this->assertDatabaseHas('todos', ['title' => $title]);
+});
+
+// ==================== #1659: todo date range on update paths ====================
+
+test('save rejects an end date before the start date', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('openModal')
+        ->set('title', 'وظیفه تستی')
+        ->set('start_date_picker', '1405/07/02')
+        ->set('start_time_picker', '09:00')
+        ->set('end_date_picker', '1405/07/01')
+        ->set('end_time_picker', '09:00')
+        ->call('save')
+        ->assertHasErrors(['end_date_picker']);
+
+    $this->assertDatabaseCount('todos', 0);
+});
+
+test('save rejects an end time before the start time on the same day', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('openModal')
+        ->set('title', 'وظیفه تستی')
+        ->set('start_date_picker', '1405/07/02')
+        ->set('start_time_picker', '10:00')
+        ->set('end_date_picker', '1405/07/02')
+        ->set('end_time_picker', '08:00')
+        ->call('save')
+        ->assertHasErrors(['end_date_picker']);
+
+    $this->assertDatabaseCount('todos', 0);
+});
+
+test('save accepts an end equal to the start', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('openModal')
+        ->set('title', 'وظیفه تستی')
+        ->set('start_date_picker', '1405/07/02')
+        ->set('start_time_picker', '10:00')
+        ->set('end_date_picker', '1405/07/02')
+        ->set('end_time_picker', '10:00')
+        ->call('save')
+        ->assertHasNoErrors();
+
+    $this->assertDatabaseCount('todos', 1);
+});
+
+test('edit with an inverted range leaves the stored row unchanged', function () {
+    $this->actingAs($this->user);
+
+    $todo = Todo::factory()->create([
+        'unit_id' => $this->unit->id,
+        'title' => 'عنوان قبل',
+        'start_at' => '2026-09-24 10:00:00',
+        'end_at' => '2026-09-25 10:00:00',
+    ]);
+
+    Livewire::test('todo.todo')
+        ->call('editEvent', $todo->id)
+        ->set('end_date_picker', '1405/07/01')
+        ->call('save')
+        ->assertHasErrors(['end_date_picker']);
+
+    $this->assertDatabaseHas('todos', [
+        'id' => $todo->id,
+        'start_at' => '2026-09-24 10:00:00',
+        'end_at' => '2026-09-25 10:00:00',
+    ]);
+});
+
+test('save allows an empty end date', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('openModal')
+        ->set('title', 'وظیفه تستی')
+        ->set('start_date_picker', '1405/07/02')
+        ->set('start_time_picker', '10:00')
+        ->set('end_date_picker', '')
+        ->call('save')
+        ->assertHasNoErrors();
+
+    $this->assertDatabaseHas('todos', ['title' => 'وظیفه تستی', 'end_at' => null]);
+});
+
+test('update_todo_dates rejects an end before the start and does not write', function () {
+    $this->actingAs($this->user);
+
+    $todo = Todo::factory()->create([
+        'unit_id' => $this->unit->id,
+        'title' => 'درگ',
+        'start_at' => '2026-09-24 10:00:00',
+        'end_at' => '2026-09-25 10:00:00',
+    ]);
+
+    Livewire::test('todo.todo')
+        ->call('updateTodoDates', $todo->id, '2026-09-24T10:00:00', '2026-09-23T10:00:00')
+        ->assertDispatched('swal', function ($name, $params) {
+            return ($params[0]['icon'] ?? '') === 'error';
+        });
+
+    $this->assertDatabaseHas('todos', [
+        'id' => $todo->id,
+        'start_at' => '2026-09-24 10:00:00',
+        'end_at' => '2026-09-25 10:00:00',
+    ]);
+});
+
+test('update_todo_dates writes a valid range', function () {
+    $this->actingAs($this->user);
+
+    $todo = Todo::factory()->create([
+        'unit_id' => $this->unit->id,
+        'title' => 'درگ',
+        'start_at' => '2026-09-24 10:00:00',
+        'end_at' => '2026-09-25 10:00:00',
+    ]);
+
+    Livewire::test('todo.todo')
+        ->call('updateTodoDates', $todo->id, '2026-09-26T10:00:00', '2026-09-27T11:00:00')
+        ->assertDispatched('swal', function ($name, $params) {
+            return ($params[0]['icon'] ?? '') === 'success';
+        });
+
+    $this->assertDatabaseHas('todos', [
+        'id' => $todo->id,
+        'start_at' => '2026-09-26 10:00:00',
+        'end_at' => '2026-09-27 11:00:00',
+    ]);
+});
+
+test('update_todo_dates treats an empty end as no end', function () {
+    $this->actingAs($this->user);
+
+    $todo = Todo::factory()->create([
+        'unit_id' => $this->unit->id,
+        'title' => 'درگ',
+        'start_at' => '2026-09-24 10:00:00',
+        'end_at' => '2026-09-25 10:00:00',
+    ]);
+
+    Livewire::test('todo.todo')
+        ->call('updateTodoDates', $todo->id, '2026-09-26T10:00:00', '');
+
+    $fresh = $todo->fresh();
+
+    expect($fresh->start_at->format('Y-m-d H:i'))->toBe('2026-09-26 10:00')
+        ->and($fresh->end_at->format('Y-m-d H:i'))->toBe('2026-09-26 10:00');
+});
+
+test('update_todo_dates rejects an unparseable date without writing', function () {
+    $this->actingAs($this->user);
+
+    $todo = Todo::factory()->create([
+        'unit_id' => $this->unit->id,
+        'title' => 'درگ',
+        'start_at' => '2026-09-24 10:00:00',
+        'end_at' => '2026-09-25 10:00:00',
+    ]);
+
+    Livewire::test('todo.todo')
+        ->call('updateTodoDates', $todo->id, 'not-a-date', null)
+        ->assertDispatched('swal', function ($name, $params) {
+            return ($params[0]['icon'] ?? '') === 'error';
+        });
+
+    $this->assertDatabaseHas('todos', [
+        'id' => $todo->id,
+        'start_at' => '2026-09-24 10:00:00',
+        'end_at' => '2026-09-25 10:00:00',
+    ]);
+});
+
+test('update_todo_dates accepts end equal to start', function () {
+    $this->actingAs($this->user);
+
+    $todo = Todo::factory()->create([
+        'unit_id' => $this->unit->id,
+        'title' => 'درگ',
+        'start_at' => '2026-09-24 10:00:00',
+        'end_at' => '2026-09-25 10:00:00',
+    ]);
+
+    Livewire::test('todo.todo')
+        ->call('updateTodoDates', $todo->id, '2026-09-26T10:00:00', '2026-09-26T10:00:00')
+        ->assertDispatched('swal', function ($name, $params) {
+            return ($params[0]['icon'] ?? '') === 'success';
+        });
+
+    $this->assertDatabaseHas('todos', [
+        'id' => $todo->id,
+        'start_at' => '2026-09-26 10:00:00',
+        'end_at' => '2026-09-26 10:00:00',
+    ]);
 });
