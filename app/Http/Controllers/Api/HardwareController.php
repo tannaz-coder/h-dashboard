@@ -11,6 +11,7 @@ use App\Rules\PerPage;
 use App\Services\CacheInvalidationServiceInterface;
 use App\Services\HardwareBulkAuditWriter;
 use App\Support\HardwareAuditChange;
+use App\Support\HardwareRules;
 use App\Support\ScopeCacheKey;
 use App\Traits\PersianNormalizer;
 use Illuminate\Http\JsonResponse;
@@ -21,42 +22,15 @@ class HardwareController extends Controller
     use PersianNormalizer;
 
     /**
-     * Shared hardware validation rules.
+     * Shared hardware validation rules — see `App\Support\HardwareRules`.
      *
      * @param  bool  $required  true = store (n_code/pc_name required), false = update (sometimes|required)
      * @param  bool  $includeShutdown  true = include shutdown boolean (update only)
+     * @return array<string, string>
      */
     private function hardwareValidationRules(bool $required = true, bool $includeShutdown = false): array
     {
-        $nCodeRule = $required ? 'required|string|exists:persons,n_code' : 'sometimes|required|string|exists:persons,n_code';
-        $pcNameRule = $required ? 'required|string|max:255' : 'sometimes|required|string|max:255';
-
-        $rules = [
-            'n_code' => $nCodeRule,
-            'pc_name' => $pcNameRule,
-            'type' => 'nullable|string|max:50',
-            'os' => 'nullable|string|max:100',
-            'ip_valid' => 'nullable|string|max:45',
-            'ip_local' => 'nullable|string|max:45',
-            'mac' => 'nullable|string|max:17',
-            'net_type' => 'nullable|string|max:50',
-            'switch' => 'nullable|string|max:100',
-            'port' => 'nullable|string|max:50',
-            'vlan' => 'nullable|string|max:50',
-            'motherboard' => 'nullable|string|max:100',
-            'cpu' => 'nullable|string|max:100',
-            'ram' => 'nullable|string|max:50',
-            'hdd' => 'nullable|string|max:100',
-            'comments' => 'nullable|string|max:20000',
-            'mark' => 'boolean',
-            'clean_at' => 'nullable|date',
-        ];
-
-        if ($includeShutdown) {
-            $rules['shutdown'] = 'boolean';
-        }
-
-        return $rules;
+        return HardwareRules::apiRules($required, $includeShutdown);
     }
 
     /**
@@ -321,25 +295,35 @@ class HardwareController extends Controller
         // Suppress individual audit entries during bulk operations
         request()->attributes->set('suppress_audit', true);
         try {
-            // Single update query on the verified IDs
-            $count = Hardware::whereIn('id', $accessibleHardwareIds)
-                ->update(['mark' => $targetMark]);
+            // #1744: the mass update and its audit rows are one atomic unit — a
+            // failed audit insert rolls the update back instead of leaving a
+            // mutation with no trail. Order stays write → audit (#1362).
+            $count = DB::transaction(function () use ($accessibleHardwareIds, $targetMark, $auditTargets): int {
+                // Single update query on the verified IDs
+                $count = Hardware::whereIn('id', $accessibleHardwareIds)
+                    ->update(['mark' => $targetMark]);
+
+                // Batch insert audit entries, one field-level diff per actually changed row
+                if ($auditTargets->isNotEmpty()) {
+                    app(HardwareBulkAuditWriter::class)->batchInsertAudits(
+                        $auditTargets,
+                        'bulk_mark',
+                        null,
+                        fn (Hardware $hw): array => [
+                            ['field' => 'mark', 'old' => $hw->mark, 'new' => $targetMark],
+                        ],
+                    );
+                }
+
+                return $count;
+            });
         } finally {
             request()->attributes->remove('suppress_audit');
         }
 
-        // Batch insert audit entries, one field-level diff per actually changed row
-        if ($auditTargets->isNotEmpty()) {
-            app(HardwareBulkAuditWriter::class)->batchInsertAudits(
-                $auditTargets,
-                'bulk_mark',
-                null,
-                fn (Hardware $hw): array => [
-                    ['field' => 'mark', 'old' => $hw->mark, 'new' => $targetMark],
-                ],
-            );
-        }
-
+        // After the commit, synchronously — not inside the transaction and not
+        // via `afterCommit()`: no listener reads uncommitted rows, and
+        // `flushStatsCache()` touches no database.
         app(CacheInvalidationServiceInterface::class)->batch(function () use ($hardwares) {
             event(new HardwareUpdated($hardwares->first(), 'bulk_mark'));
             Hardware::flushStatsCache(); // Issue #376: bulk update bypasses Eloquent events
@@ -377,24 +361,32 @@ class HardwareController extends Controller
         // Suppress individual audit entries during bulk operations
         request()->attributes->set('suppress_audit', true);
         try {
-            $count = Hardware::whereIn('id', $accessibleHardwareIds)->delete();
+            // #1744: the mass delete and its audit rows are one atomic unit — a
+            // failed audit insert rolls the delete back. Order stays delete →
+            // audit (#1362).
+            $count = DB::transaction(function () use ($accessibleHardwareIds, $hardwares): int {
+                $count = Hardware::whereIn('id', $accessibleHardwareIds)->delete();
+
+                // #1362: write the bulk_delete audit only AFTER the delete succeeds. The
+                // batch delete bypasses Eloquent events, so this is the only place the trail
+                // can be reconciled with the outcome; writing it first left phantom rows on a
+                // failed delete. #927: `changes` is a field-level diff list [{field,old,new}].
+                if ($count > 0) {
+                    app(HardwareBulkAuditWriter::class)->batchInsertAudits(
+                        $hardwares,
+                        'bulk_delete',
+                        null,
+                        fn (Hardware $hw) => HardwareAuditChange::deletionSnapshot($hw),
+                    );
+                }
+
+                return $count;
+            });
         } finally {
             request()->attributes->remove('suppress_audit');
         }
 
-        // #1362: write the bulk_delete audit only AFTER the delete succeeds. The
-        // batch delete bypasses Eloquent events, so this is the only place the trail
-        // can be reconciled with the outcome; writing it first left phantom rows on a
-        // failed delete. #927: `changes` is a field-level diff list [{field,old,new}].
-        if ($count > 0) {
-            app(HardwareBulkAuditWriter::class)->batchInsertAudits(
-                $hardwares,
-                'bulk_delete',
-                null,
-                fn (Hardware $hw) => HardwareAuditChange::deletionSnapshot($hw),
-            );
-        }
-
+        // After the commit, synchronously — see bulkMark() for why.
         app(CacheInvalidationServiceInterface::class)->batch(function () use ($hardwares) {
             event(new HardwareUpdated($hardwares->first(), 'bulk_deleted'));
             Hardware::flushStatsCache(); // Issue #376: bulk delete bypasses Eloquent events

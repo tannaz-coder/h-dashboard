@@ -9,16 +9,18 @@ use App\Services\AccessService;
 use App\Services\CacheInvalidationServiceInterface;
 use App\Services\HardwareBulkAuditWriter;
 use App\Support\HardwareAuditChange;
+use App\Support\HardwareRules;
+use App\Traits\ClampsPageSize;
 use App\Traits\HardwareIndexHelpers;
 use App\Traits\PersianNormalizer;
 use Illuminate\Pagination\LengthAwarePaginator;
-use Illuminate\Validation\Rule;
 use Livewire\Component;
 use Livewire\WithPagination;
 use Mary\Traits\Toast;
 
 return new class extends Component
 {
+    use ClampsPageSize;
     use HardwareIndexHelpers;
     use PersianNormalizer;
     use Toast;
@@ -322,14 +324,16 @@ return new class extends Component
         // check could undo.
         $this->authorize('manage_hardware');
 
-        $this->validate([
-            'n_code' => ['required', 'string', Rule::exists('persons', 'n_code')->where(fn ($q) => $q->whereIn('u_id', $this->accessibleUnitIds()))],
-            'pc_name' => 'required|string|max:255',
-            'comments' => 'nullable|string|max:20000',
-        ]);
+        $accessibleIds = $this->accessibleUnitIds();
+
+        // #1730: an empty <input type="date"> sends '', and `Carbon::parse('')`
+        // is "now" — it would store today. The API stores null (its HTTP
+        // middleware converts empty strings first); normalise for parity.
+        $this->clean_at = filled($this->clean_at) ? $this->clean_at : null;
+
+        $this->validate(HardwareRules::webRules($accessibleIds));
 
         $person = Person::where('n_code', $this->n_code)->firstOrFail();
-        $accessibleIds = $this->accessibleUnitIds();
 
         if (! in_array($person->u_id, $accessibleIds)) {
             $this->error('شما به این پرسنل دسترسی ندارید.', position: 'toast-bottom');
@@ -397,11 +401,10 @@ return new class extends Component
             }
         }
 
-        $this->validate([
-            'n_code' => ['required', 'string', Rule::exists('persons', 'n_code')->where(fn ($q) => $q->whereIn('u_id', $accessibleIds))],
-            'pc_name' => 'required|string|max:255',
-            'comments' => 'nullable|string|max:20000',
-        ]);
+        // #1730: same '' → null normalisation as createHardware() — see there.
+        $this->clean_at = filled($this->clean_at) ? $this->clean_at : null;
+
+        $this->validate(HardwareRules::webRules($accessibleIds));
 
         $hw = Hardware::with('person')->findOrFail($this->editingId);
 
@@ -496,23 +499,32 @@ return new class extends Component
         // silently double-audit.
         request()->attributes->set('suppress_audit', true);
         try {
-            Hardware::whereIn('id', $scopedIds)->update(['mark' => $value]);
+            // #1744: the mass update and its audit rows are one atomic unit — a
+            // failed audit insert rolls the update back. Order stays write →
+            // audit (#1675/#1362).
+            \Illuminate\Support\Facades\DB::transaction(function () use ($scopedIds, $value, $auditTargets): void {
+                Hardware::whereIn('id', $scopedIds)->update(['mark' => $value]);
+
+                // #1675/#1362: written only AFTER the update succeeds, and only for rows
+                // whose value actually changed — same writer and shape as the API.
+                if ($auditTargets->isNotEmpty()) {
+                    app(HardwareBulkAuditWriter::class)->batchInsertAudits(
+                        $auditTargets,
+                        'bulk_mark',
+                        null,
+                        fn (Hardware $hw): array => [
+                            ['field' => 'mark', 'old' => $hw->mark, 'new' => $value],
+                        ],
+                    );
+                }
+            });
         } finally {
             request()->attributes->remove('suppress_audit');
         }
 
-        // #1675/#1362: written only AFTER the update succeeds, and only for rows
-        // whose value actually changed — same writer and shape as the API.
-        if ($auditTargets->isNotEmpty()) {
-            app(HardwareBulkAuditWriter::class)->batchInsertAudits(
-                $auditTargets,
-                'bulk_mark',
-                null,
-                fn (Hardware $hw): array => [
-                    ['field' => 'mark', 'old' => $hw->mark, 'new' => $value],
-                ],
-            );
-        }
+        // After the commit, synchronously — not inside the transaction and not
+        // via `afterCommit()`: no listener reads uncommitted rows, and
+        // `flushStatsCache()` touches no database.
 
         // #1026/#1675: parity with the API path — listeners on HardwareUpdated
         // and the stats cache must see a web bulk mark too.
@@ -601,22 +613,31 @@ return new class extends Component
         // mirrors HardwareController::bulkDelete().
         request()->attributes->set('suppress_audit', true);
         try {
-            $count = Hardware::whereIn('id', $scopedIds)->delete();
+            // #1744: the mass delete and its audit rows are one atomic unit — a
+            // failed audit insert rolls the delete back. Order stays delete →
+            // audit (#1362).
+            \Illuminate\Support\Facades\DB::transaction(function () use ($scopedIds, $hardwares): void {
+                $count = Hardware::whereIn('id', $scopedIds)->delete();
+
+                // #1026: a mass delete fires no model `deleting` event, so the audit must
+                // be written manually — but only AFTER the delete succeeds to avoid
+                // phantom rows on failure (Issue #1362). Same writer and shape as the API.
+                if ($count > 0) {
+                    app(HardwareBulkAuditWriter::class)->batchInsertAudits(
+                        $hardwares,
+                        'bulk_delete',
+                        null,
+                        fn (Hardware $hw) => HardwareAuditChange::deletionSnapshot($hw),
+                    );
+                }
+            });
         } finally {
             request()->attributes->remove('suppress_audit');
         }
 
-        if ($count > 0) {
-            app(HardwareBulkAuditWriter::class)->batchInsertAudits(
-                $hardwares,
-                'bulk_delete',
-                null,
-                fn (Hardware $hw) => HardwareAuditChange::deletionSnapshot($hw),
-            );
-        }
-
         // #1026: parity with the API path — listeners on HardwareUpdated and the
-        // stats cache must see a web bulk delete too.
+        // stats cache must see a web bulk delete too. After the commit,
+        // synchronously — see bulkMark().
         app(CacheInvalidationServiceInterface::class)->batch(function () use ($hardwares) {
             event(new HardwareUpdated($hardwares->first(), 'bulk_deleted'));
             Hardware::flushStatsCache(); // Issue #376: bulk delete bypasses Eloquent events
@@ -691,7 +712,7 @@ return new class extends Component
         $direction = ($this->sortBy['direction'] ?? 'desc') === 'asc' ? 'asc' : 'desc';
         $query->orderBy($column, $direction);
 
-        return $this->hardwaresCache = $query->paginate($this->perPage);
+        return $this->hardwaresCache = $query->paginate($this->pageSize());
     }
 
     public function with(): array

@@ -16,6 +16,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
 use Livewire\Features\SupportTesting\Testable;
 use Livewire\Livewire;
 use Tests\Support\Concerns\InteractsWithTestSetup;
@@ -357,6 +358,41 @@ class UnitsIndexLivewireTest extends TestCase
         $this->assertDatabaseHas('units', ['name' => 'unit_test_name', 'unit_type_id' => 3]);
     }
 
+    /**
+     * #1707: a failed create must leave the modal open with the user's input.
+     *
+     * The failure is induced on `eloquent.creating` — the point where a real
+     * persistence error surfaces — because a genuine PG error would abort the
+     * RefreshDatabase transaction (same constraint documented on
+     * `test_delete_unit_with_tickets_is_refused`).
+     */
+    public function test_create_unit_keeps_modal_and_form_when_the_save_throws(): void
+    {
+        ['user' => $user, 'unit' => $parent] = $this->createUserWithUnit(['organization']);
+        $parent->update(['unit_type_id' => 2]);
+        $this->actingAs($user);
+
+        Unit::creating(function (): void {
+            throw new \RuntimeException('simulated persistence failure');
+        });
+
+        try {
+            Livewire::test('units.index')
+                ->call('openModalForCreate')
+                ->set('name', 'واحد ذخیره‌نشده')
+                ->set('unit_type_id', 3)
+                ->set('parent_id', $parent->id)
+                ->call('saveUnit')
+                ->assertSet('modal', true)
+                ->assertSet('name', 'واحد ذخیره‌نشده')
+                ->assertSet('parent_id', $parent->id);
+        } finally {
+            Unit::getEventDispatcher()->forget('eloquent.creating: '.Unit::class);
+        }
+
+        $this->assertDatabaseMissing('units', ['name' => 'واحد ذخیره‌نشده']);
+    }
+
     // ==================== Edit unit ====================
 
     public function test_edit_unit(): void
@@ -383,6 +419,46 @@ class UnitsIndexLivewireTest extends TestCase
             ->call('saveUnit');
 
         $this->assertDatabaseHas('units', ['id' => $target->id, 'name' => 'unit_updated_name']);
+    }
+
+    /**
+     * #1707: a save that throws must not close the modal, wipe the form, or
+     * write a population row.
+     *
+     * The row is deleted between `editUnit()` and `saveUnit()`, so
+     * `findOrFail()` throws the way it would on a concurrent delete. The scope
+     * check still passes because the accessible list was cached during
+     * `editUnit()` and nothing invalidated it in between; if that ever stops
+     * holding, the scope toast fires first and this test goes red on the
+     * toast assertion — fix the trigger, not the assertion.
+     */
+    public function test_edit_unit_keeps_modal_and_form_when_the_row_vanished(): void
+    {
+        ['user' => $user, 'unit' => $parent] = $this->createUserWithUnit(['organization']);
+        $parent->update(['unit_type_id' => 2]);
+        $this->actingAs($user);
+
+        $target = Unit::create([
+            'name' => 'واحد حذف‌شده', 'unit_type_id' => 3,
+            'region_id' => 2, 'parent_id' => $parent->id,
+        ]);
+
+        Log::spy();
+        Log::shouldReceive('warning')->once();
+
+        $component = Livewire::test('units.index')->call('editUnit', $target->id);
+        $component->set('name', 'نام جدید')->set('description', 'توضیح جدید');
+
+        DB::table('units')->where('id', $target->id)->delete();
+
+        $component->call('saveUnit')
+            ->assertSet('modal', true)
+            ->assertSet('editingId', $target->id)
+            ->assertSet('name', 'نام جدید')
+            ->assertSet('description', 'توضیح جدید');
+
+        $this->toastContaining($component, 'خطا');
+        $this->assertDatabaseMissing('units', ['name' => 'نام جدید']);
     }
 
     // ==================== #1679: can_receive_tickets write authority ====================
@@ -637,6 +713,59 @@ class UnitsIndexLivewireTest extends TestCase
 
         // Tree unchanged: the cycle write was rejected.
         $this->assertEquals($originalParentId, $child->fresh()->parent_id);
+    }
+
+    // ==================== #1737: inactive descendant still blocks a cycle ====================
+
+    public function test_save_unit_denied_with_inactive_descendant_parent(): void
+    {
+        // #1737: deactivating a descendant must not hide it from the cycle
+        // guard. Type 22 (self-edge) is used so the type rule can never be the
+        // refusal, and both units are attached + the session scope cleared so
+        // the scope gate can never be the refusal either — the cycle toast is
+        // the only remaining reason the write can be rejected.
+        ['user' => $user, 'unit' => $a] = $this->createUserWithUnit(['organization']);
+        $a->update(['unit_type_id' => 22]);
+
+        $b = Unit::create([
+            'name' => 'فرزند غیرفعال', 'unit_type_id' => 22,
+            'parent_id' => $a->id, 'is_active' => false,
+        ]);
+        $user->units()->attach($b->id, ['role' => 'staff', 'is_primary' => false]);
+        session()->forget('current_unit_id');
+        $this->actingAs($user);
+
+        $originalParentId = $a->parent_id;
+
+        $component = Livewire::test('units.index')
+            ->call('editUnit', $a->id)
+            ->set('parent_id', $b->id)
+            ->call('saveUnit');
+
+        $this->assertEquals($originalParentId, $a->fresh()->parent_id);
+        $this->toastContaining($component, 'نمی‌توان واحد را زیرمجموعه');
+    }
+
+    public function test_save_unit_allows_reparent_under_an_unrelated_active_unit(): void
+    {
+        // Positive control for the structural variant: an unrelated active unit
+        // is a legal parent and the write must land.
+        ['user' => $user, 'unit' => $a] = $this->createUserWithUnit(['organization']);
+        $a->update(['unit_type_id' => 22]);
+
+        $unrelated = Unit::create([
+            'name' => 'واحد نامرتبط', 'unit_type_id' => 22, 'is_active' => true,
+        ]);
+        $user->units()->attach($unrelated->id, ['role' => 'staff', 'is_primary' => false]);
+        session()->forget('current_unit_id');
+        $this->actingAs($user);
+
+        Livewire::test('units.index')
+            ->call('editUnit', $a->id)
+            ->set('parent_id', $unrelated->id)
+            ->call('saveUnit');
+
+        $this->assertSame($unrelated->id, $a->fresh()->parent_id);
     }
 
     // ==================== #817: toggle refused out of scope ====================

@@ -4,6 +4,7 @@ use App\Models\MaintenanceSchedule;
 use App\Models\Unit;
 use App\Models\User;
 use App\Services\AccessService;
+use App\Traits\ClampsPageSize;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Facades\Auth;
 use Livewire\Component;
@@ -12,6 +13,7 @@ use Mary\Traits\Toast;
 
 return new class extends Component
 {
+    use ClampsPageSize;
     use Toast;
     use WithPagination;
 
@@ -143,13 +145,21 @@ return new class extends Component
         }
 
         try {
-            $schedule->update([
+            $payload = [
                 'title' => $this->title,
                 'frequency' => $this->frequency,
                 'recurrence_interval' => $this->recurrenceInterval,
                 'unit_id' => $this->unitId,
-                'next_due_at' => $this->calculateNextDue($schedule->created_at?->day),
-            ]);
+            ];
+
+            // ویرایش عنوان/واحد نباید ساعت زمان‌بندی را بازنشانی کند؛ فقط تغییر
+            // واقعی دوره یا فاصله، محاسبهٔ مجدد را تحریک می‌کند (#1706).
+            if ($this->frequency !== $schedule->frequency
+                || $this->recurrenceInterval !== $schedule->recurrence_interval) {
+                $payload['next_due_at'] = $this->calculateNextDue($schedule->created_at?->day);
+            }
+
+            $schedule->update($payload);
 
             $this->success("«{$this->title}» بروزرسانی شد", 'با موفقیت', position: 'toast-bottom');
             $this->cancelEdit();
@@ -335,7 +345,7 @@ return new class extends Component
         $direction = ($this->sortBy['direction'] ?? 'asc') === 'desc' ? 'desc' : 'asc';
         $query->orderBy($column, $direction);
 
-        return $query->paginate($this->perPage);
+        return $query->paginate($this->pageSize());
     }
 
     public function with(): array
