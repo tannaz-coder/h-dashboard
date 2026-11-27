@@ -43,14 +43,20 @@ return Application::configure(basePath: dirname(__DIR__))
         // 60 minutes leaves the dailies ~23 hours to recover; 120 fits the
         // weekly archive. `data:archive` also locks inside the command, which
         // is what stops a manual run racing the scheduled one.
-        // Recurring todos — daily at 02:00 Tehran time
-        $schedule->command('todos:generate-recurring')->dailyAt('02:00')->withoutOverlapping(60);
-
         // Maintenance tasks — daily at 03:00 Tehran time
         $schedule->command('maintenance:generate-due')->dailyAt('03:00')->withoutOverlapping(60);
 
         // Data archival — weekly Monday 04:00 Tehran time
         $schedule->command('data:archive')->weeklyOn(1, '04:00')->withoutOverlapping(120);
+
+        // #1809: system (null-actor) activity rows are written by queue/scheduler
+        // paths and ON DELETE SET NULL; whereIn('user_id', …) can never match them,
+        // so the archive job's 90-day window silently skips them. Deliberately NOT
+        // ->job(new ArchiveActivityLogsJob(90)): an org-wide run would also delete
+        // user-owned logs older than 90 days and bypass the 12-month data:archive
+        // policy. Inline so withoutOverlapping() is a real execution lock; Tuesday
+        // 04:00 keeps it a day off data:archive.
+        $schedule->command('activity:prune-null-actor')->weeklyOn(2, '04:00')->withoutOverlapping(120);
 
         // Issue #1692: the download removes its archive once it is sent, so any
         // archive still here is a leftover from a killed worker. 05:00 clears
@@ -61,6 +67,14 @@ return Application::configure(basePath: dirname(__DIR__))
         // how long it lives. 05:15 sits between archival cleanup and report
         // generation.
         $schedule->command('imports:prune-sheets')->dailyAt('05:15')->withoutOverlapping(60);
+
+        // #1820: /api/login mints a token on every call and no prior token is
+        // revoked, so guard-expired rows accumulated in personal_access_tokens.
+        // 05:30 sits between imports:prune-sheets (05:15) and
+        // reports:generate-daily (06:00). Sanctum keeps its default 24h grace,
+        // so a row is removed once created_at passes expiration+24h (48h with
+        // the default 1440-minute token lifetime).
+        $schedule->command('sanctum:prune-expired')->dailyAt('05:30')->withoutOverlapping(60);
 
         // Report generation — daily at 06:00 Tehran time
         // Issue #1021: withoutOverlapping() so a slow run cannot stack on the

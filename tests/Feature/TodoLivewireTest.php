@@ -156,6 +156,50 @@ test('open create modal sets start and end dates', function () {
         ->assertSet('end_at', '2026-10-05');
 });
 
+// ==================== Issue #1811: untrusted calendar dates ====================
+
+test('open create modal rejects an unparseable date without storing it', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('openCreateModal', 'not-a-date', null)
+        ->assertDispatched('swal', function ($name, $params) {
+            return ($params[0]['icon'] ?? '') === 'error';
+        })
+        ->assertSet('modal', false)
+        ->assertSet('start_at', null)
+        ->assertSet('end_at', null);
+});
+
+test('fetch events rejects unparseable dates without storing them', function () {
+    $this->actingAs($this->user);
+
+    $component = Livewire::test('todo.todo')
+        ->call('fetchEvents', 'not-a-date', 'not-a-date')
+        ->assertDispatched('swal', function ($name, $params) {
+            return ($params[0]['icon'] ?? '') === 'error';
+        });
+
+    // If the garbage bound had been stored, getEvents() would hit a Postgres
+    // invalid-timestamp error (SQLSTATE 22007) instead of returning an array.
+    expect($component->instance()->getEvents())->toBeArray();
+
+    // A well-formed call still loads events.
+    $component
+        ->call('fetchEvents', '2026-10-01 00:00:00', '2026-10-31 23:59:59')
+        ->assertDispatched('calendar-updated');
+});
+
+test('fetch events rejects array arguments without a type error', function () {
+    $this->actingAs($this->user);
+
+    Livewire::test('todo.todo')
+        ->call('fetchEvents', ['2026-10-01'], ['2026-10-31'])
+        ->assertDispatched('swal', function ($name, $params) {
+            return ($params[0]['icon'] ?? '') === 'error';
+        });
+});
+
 test('close modal resets form', function () {
     $this->actingAs($this->user);
 
@@ -1327,7 +1371,33 @@ test('update_todo_dates treats an empty end as no end', function () {
     $fresh = $todo->fresh();
 
     expect($fresh->start_at->format('Y-m-d H:i'))->toBe('2026-09-26 10:00')
-        ->and($fresh->end_at->format('Y-m-d H:i'))->toBe('2026-09-26 10:00');
+        ->and($fresh->end_at)->toBeNull();
+
+    $this->assertDatabaseHas('todos', ['id' => $todo->id, 'end_at' => null]);
+});
+
+test('update_todo_dates keeps a null end null when dragging an end-less todo', function () {
+    $this->actingAs($this->user);
+
+    $todo = Todo::factory()->create([
+        'unit_id' => $this->unit->id,
+        'title' => 'درگ بدون پایان',
+        'start_at' => '2026-09-24 10:00:00',
+        'end_at' => null,
+    ]);
+
+    Livewire::test('todo.todo')
+        ->call('updateTodoDates', $todo->id, '2026-09-26T10:00:00', '')
+        ->assertDispatched('swal', function ($name, $params) {
+            return ($params[0]['icon'] ?? '') === 'success';
+        });
+
+    $fresh = $todo->fresh();
+
+    expect($fresh->start_at->format('Y-m-d H:i'))->toBe('2026-09-26 10:00')
+        ->and($fresh->end_at)->toBeNull();
+
+    $this->assertDatabaseHas('todos', ['id' => $todo->id, 'end_at' => null]);
 });
 
 test('update_todo_dates rejects an unparseable date without writing', function () {

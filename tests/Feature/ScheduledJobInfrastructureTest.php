@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Console\Commands\PruneStaleCache;
+use App\Jobs\ArchiveActivityLogsJob;
 use App\Jobs\SyncZabbixJob;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Contracts\Console\Kernel;
@@ -58,16 +59,31 @@ class ScheduledJobInfrastructureTest extends TestCase
         }
 
         $this->assertContains('cache:prune-stale', $commands);
-        $this->assertContains('todos:generate-recurring', $commands);
         $this->assertContains('maintenance:generate-due', $commands);
         $this->assertContains('data:archive', $commands);
         $this->assertContains('backup:prune-archives', $commands);
         $this->assertContains('imports:prune-sheets', $commands);
+        $this->assertContains('sanctum:prune-expired', $commands);
         $this->assertContains('reports:generate-daily', $commands);
+        $this->assertContains('activity:prune-null-actor', $commands);
+
+        // #1820: the prune time is part of the contract — 05:30 sits between
+        // imports:prune-sheets (05:15) and reports:generate-daily (06:00).
+        $prune = collect($events)->first(
+            fn ($event) => is_string($event->command) && str_contains($event->command, 'sanctum:prune-expired')
+        );
+        $this->assertNotNull($prune, 'sanctum:prune-expired must be scheduled');
+        $this->assertSame('30 5 * * *', $prune->expression);
 
         // zabbix:sync is now dispatched as SyncZabbixJob, not an artisan command
         $descriptions = array_map(fn ($event) => $event->description ?? '', $events);
         $this->assertContains(SyncZabbixJob::class, $descriptions);
+
+        // #1809 STOP condition: the archive job must never be scheduled
+        // org-wide — that would delete user-owned logs older than 90 days and
+        // bypass the 12-month `data:archive` policy. Only the NULL-only sweep
+        // command is scheduled.
+        $this->assertNotContains(ArchiveActivityLogsJob::class, $descriptions);
     }
 
     /**
@@ -82,27 +98,28 @@ class ScheduledJobInfrastructureTest extends TestCase
         $events = $this->app->make(Schedule::class)->events();
 
         $this->assertCount(
-            8,
+            9,
             $events,
-            'the schedule must keep exactly the eight registered items — zero means the wiring was dropped'
+            'the schedule must keep exactly the nine registered items — zero means the wiring was dropped'
         );
     }
 
     /**
-     * #1305: the three writers that had no overlap guard. The expiry is pinned
+     * #1305: the writers that had no overlap guard. The expiry is pinned
      * too: the default 1440 minutes is the entire interval of a daily run, so a
      * crashed run would hold the lock until the next start.
      */
-    public function test_the_three_writers_hold_a_bounded_overlap_lock(): void
+    public function test_the_writers_hold_a_bounded_overlap_lock(): void
     {
         $this->bootConsoleSchedule();
 
         $events = $this->app->make(Schedule::class)->events();
 
         $expected = [
-            'todos:generate-recurring' => 60,
             'maintenance:generate-due' => 60,
             'data:archive' => 120,
+            'activity:prune-null-actor' => 120,
+            'sanctum:prune-expired' => 60,
         ];
 
         foreach ($expected as $command => $minutes) {
@@ -139,12 +156,6 @@ class ScheduledJobInfrastructureTest extends TestCase
     public function test_prune_stale_cache_command_runs(): void
     {
         $exitCode = Artisan::call('cache:prune-stale');
-        $this->assertEquals(0, $exitCode);
-    }
-
-    public function test_generate_recurring_todos_command_runs(): void
-    {
-        $exitCode = Artisan::call('todos:generate-recurring');
         $this->assertEquals(0, $exitCode);
     }
 

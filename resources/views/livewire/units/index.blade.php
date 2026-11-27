@@ -8,6 +8,7 @@ use App\Services\AccessService;
 use App\Services\UnitDeletionImpact;
 use App\Services\UnitDeletionService;
 use App\Traits\ClampsPageSize;
+use App\Traits\PersianNormalizer;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Livewire\Attributes\Locked;
 use Livewire\Component;
@@ -17,6 +18,7 @@ use Mary\Traits\Toast;
 return new class extends Component
 {
     use ClampsPageSize;
+    use PersianNormalizer;
     use Toast;
     use WithPagination;
 
@@ -138,7 +140,7 @@ return new class extends Component
         }
 
         if (! empty($this->search)) {
-            $query->where('name', 'LIKE', '%'.$this->search.'%');
+            $query->where('name', 'LIKE', '%'.self::escapeLikeWildcards($this->search).'%');
         }
 
         $column = in_array($this->sortBy['column'] ?? '', self::SORTABLE_COLUMNS, true)
@@ -595,7 +597,7 @@ return new class extends Component
         }
 
         // #949 steps 2–4: refuse, and say what is actually in the way.
-        // Six of the eight inbound FKs on `units` are not RESTRICT, so a delete
+        // Six of the eleven inbound FKs on `units` are not RESTRICT, so a delete
         // here used to silently NULL `persons.u_id`, NULL `todos.unit_id` and
         // CASCADE away `user_units` rows — orphaning 155 of 318 accounts from
         // the org tree while reporting a green toast. The counts, not this
@@ -613,15 +615,17 @@ return new class extends Component
             $unit->delete();
             $this->warning("$unit->name حذف شد ", 'با موفقیت', position: 'toast-bottom');
         } catch (\Exception $e) {
-            // Honest scope of this catch: it covers the two RESTRICT FKs only —
-            // `units_parent_fk` and `tickets_unit_fk` — in the window between
-            // the count above and this delete. The four non-RESTRICT tables do
-            // NOT raise here: a `persons` / `todos` / `user_units` row landing
-            // in that same window still produces a successful delete with the
-            // green toast above. READ COMMITTED does not close that race, and
-            // this issue does not claim it does. Closing it needs a decision
-            // about serialising unit deletes; until then the counts narrow the
-            // window, they do not remove it.
+            // Honest scope of this catch: the counts above cover all five
+            // RESTRICT FKs — `units_parent_fk`, `tickets_unit_fk`,
+            // `disease_cases.unit_id` / `subject_unit_id` and
+            // `unit_populations.unit_id` — so this catch only covers the window
+            // between the count and this delete for those five. The six
+            // non-RESTRICT tables do NOT raise here: a `persons` / `todos` /
+            // `user_units` row landing in that same window still produces a
+            // successful delete with the green toast above. READ COMMITTED does
+            // not close that race, and this issue does not claim it does.
+            // Closing it needs a decision about serialising unit deletes;
+            // until then the counts narrow the window, they do not remove it.
             $this->error('حذف واحد انجام نشد؛ هم‌زمان تغییری در اطلاعات آن رخ داد. دوباره تلاش کنید.', position: 'toast-bottom');
         }
 
@@ -640,6 +644,8 @@ return new class extends Component
         $labels = [
             'children' => 'زیرمجموعه',
             'tickets' => 'تیکت',
+            'disease_cases' => 'پرونده بیماری',
+            'populations' => 'ردیف جمعیت',
             'persons' => 'پرسنل',
             'hardware' => 'سخت‌افزار',
             'todos' => 'وظیفه',
@@ -773,12 +779,38 @@ return new class extends Component
             return;
         }
 
-        $unit->can_receive_tickets = ! $unit->can_receive_tickets;
-        $unit->saveQuietly();
+        // #1849: read-invert-save loses concurrent toggles. Lock the row, derive
+        // the new value from the LOCKED read, write inside the same transaction.
+        // FQCN on purpose: no new `use` here (a shifted anonymous-class line
+        // would unmatch every phpstan-baseline entry for this file).
+        $toggled = \Illuminate\Support\Facades\DB::transaction(function () use ($unit): ?bool {
+            $rows = \Illuminate\Support\Facades\DB::select(
+                'SELECT id, can_receive_tickets FROM units WHERE id = ? FOR UPDATE',
+                [$unit->id],
+            );
 
-        $status = $unit->can_receive_tickets ? 'فعال شد' : 'غیرفعال شد';
+            if ($rows === []) {
+                return null;
+            }
+
+            $new = ! (bool) $rows[0]->can_receive_tickets;
+            $unit->can_receive_tickets = $new;
+            $unit->saveQuietly(); // deliberate: skips Unit::updated, see the is_active comment above
+
+            return $new;
+        });
+
+        if ($toggled === null) {
+            $this->error('واحد یافت نشد.', position: 'toast-bottom');
+
+            return;
+        }
+
+        $status = $toggled ? 'فعال شد' : 'غیرفعال شد';
         $this->success("واحد «{$unit->name}» برای پذیرش تیکت {$status}.", position: 'toast-bottom');
 
+        // After the transaction commits: bumping before commit lets a concurrent
+        // reader cache the pre-commit row under the NEW version.
         app(\App\Services\AccessService::class)->clearAllCaches();
     }
 

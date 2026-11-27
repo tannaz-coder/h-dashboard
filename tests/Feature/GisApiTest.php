@@ -47,13 +47,20 @@ class GisApiTest extends TestCase
      * UnitFactory assigns random lat/lng that may fall outside the test bbox
      * (48-49E, 36-37N), hiding units/hardware/tickets from GIS responses.
      * Pin the user's unit inside the bbox after creation.
+     *
+     * @param  array<int, string>  $permissions
      */
-    private function createBBoxUser(): array
+    private function createBBoxUserWith(array $permissions = ['map']): array
     {
-        $result = $this->createUserWithUnit(['map']);
+        $result = $this->createUserWithUnit($permissions);
         $result['unit']->update(['lat' => 36.669343, 'lng' => 48.47163]);
 
         return $result;
+    }
+
+    private function createBBoxUser(): array
+    {
+        return $this->createBBoxUserWith(['map']);
     }
 
     /** @test */
@@ -108,7 +115,7 @@ class GisApiTest extends TestCase
     /** @test */
     public function test_gis_hardware_returns_geojson_feature_collection(): void
     {
-        ['user' => $user, 'unit' => $unit] = $this->createBBoxUser();
+        ['user' => $user, 'unit' => $unit] = $this->createBBoxUserWith(['map', 'manage_hardware']);
         $person = Person::where('u_id', $unit->id)->first();
 
         Hardware::create([
@@ -136,7 +143,7 @@ class GisApiTest extends TestCase
     /** @test */
     public function test_gis_hardware_filters_by_type(): void
     {
-        ['user' => $user, 'unit' => $unit] = $this->createBBoxUser();
+        ['user' => $user, 'unit' => $unit] = $this->createBBoxUserWith(['map', 'manage_hardware']);
         $person = Person::where('u_id', $unit->id)->first();
 
         Hardware::create([
@@ -157,10 +164,50 @@ class GisApiTest extends TestCase
         $this->assertEquals('laptop', $response->json('features.0.properties.type'));
     }
 
+    // === Issue #1811: array params are 422, not a TypeError 500 ===
+
+    /** @test */
+    public function test_gis_hardware_rejects_array_type(): void
+    {
+        ['user' => $user] = $this->createBBoxUserWith(['map', 'manage_hardware']);
+
+        $token = $this->createApiToken($user, ['gis:read']);
+        $response = $this->apiGet('/api/gis/hardware?bbox=48,36,49,37&type[]=x', $token);
+
+        $response->assertStatus(422)
+            ->assertJsonValidationErrors('type');
+    }
+
+    /** @test */
+    public function test_gis_hardware_type_filter_keeps_the_raw_like_semantics(): void
+    {
+        ['user' => $user, 'unit' => $unit] = $this->createBBoxUserWith(['map', 'manage_hardware']);
+        $person = Person::where('u_id', $unit->id)->first();
+
+        Hardware::create([
+            'n_code' => $person->n_code,
+            'pc_name' => 'Laptop-001',
+            'type' => 'laptop',
+        ]);
+        Hardware::create([
+            'n_code' => $person->n_code,
+            'pc_name' => 'PC-001',
+            'type' => 'desktop',
+        ]);
+
+        $token = $this->createApiToken($user, ['gis:read']);
+        $response = $this->apiGet('/api/gis/hardware?bbox=48,36,49,37&type=desktop', $token);
+
+        // #1811: the inline LIKE is kept (no HardwareFilters alias mapping),
+        // so `desktop` matches the stored `desktop` row verbatim.
+        $this->assertCount(1, $response->json('features'));
+        $this->assertEquals('desktop', $response->json('features.0.properties.type'));
+    }
+
     /** @test */
     public function test_gis_tickets_returns_geojson_feature_collection(): void
     {
-        ['user' => $user, 'unit' => $unit] = $this->createBBoxUser();
+        ['user' => $user, 'unit' => $unit] = $this->createBBoxUserWith(['map', 'view_all_tickets']);
         Ticket::create([
             'ticket_code' => 'TKT-001',
             'user_id' => $user->id,
@@ -188,7 +235,7 @@ class GisApiTest extends TestCase
     /** @test */
     public function test_gis_tickets_filters_by_priority_and_status(): void
     {
-        ['user' => $user, 'unit' => $unit] = $this->createBBoxUser();
+        ['user' => $user, 'unit' => $unit] = $this->createBBoxUserWith(['map', 'view_all_tickets']);
 
         Ticket::create([
             'ticket_code' => 'TKT-001',
@@ -231,6 +278,32 @@ class GisApiTest extends TestCase
         $this->assertEquals('completed', $response->json('features.0.properties.status'));
     }
 
+    // === Issue #1811: array params are 422, not a silently coerced 200 ===
+
+    /** @test */
+    public function test_gis_tickets_rejects_array_priority(): void
+    {
+        ['user' => $user] = $this->createBBoxUserWith(['map', 'view_all_tickets']);
+
+        $token = $this->createApiToken($user, ['gis:read']);
+        $response = $this->apiGet('/api/gis/tickets?bbox=48,36,49,37&priority[]=x', $token);
+
+        $response->assertStatus(422)
+            ->assertJsonValidationErrors('priority');
+    }
+
+    /** @test */
+    public function test_gis_tickets_rejects_array_status(): void
+    {
+        ['user' => $user] = $this->createBBoxUserWith(['map', 'view_all_tickets']);
+
+        $token = $this->createApiToken($user, ['gis:read']);
+        $response = $this->apiGet('/api/gis/tickets?bbox=48,36,49,37&status[]=x', $token);
+
+        $response->assertStatus(422)
+            ->assertJsonValidationErrors('status');
+    }
+
     /**
      * The GIS ticket layer serializes 6 fields only — the ticket body
      * (`content`) must never be hydrated into the response.
@@ -239,7 +312,7 @@ class GisApiTest extends TestCase
      */
     public function test_gis_tickets_response_omits_the_content_column(): void
     {
-        ['user' => $user, 'unit' => $unit] = $this->createBBoxUser();
+        ['user' => $user, 'unit' => $unit] = $this->createBBoxUserWith(['map', 'view_all_tickets']);
         $marker = 'SECRET-TICKET-BODY-MARKER';
         Ticket::create([
             'ticket_code' => 'TKT-LONG',
@@ -266,6 +339,77 @@ class GisApiTest extends TestCase
 
         $response->assertJsonMissingPath('features.0.properties.content');
         $this->assertStringNotContainsString($marker, $response->getContent());
+    }
+
+    /**
+     * #1743: authorized callers keep the exact payload they had — the fix only
+     * narrows WHO may read it, never what it contains.
+     *
+     * @test
+     */
+    public function test_gis_data_payloads_are_unchanged_for_authorized_callers(): void
+    {
+        ['user' => $user, 'unit' => $unit] = $this->createBBoxUserWith(['map', 'manage_hardware', 'view_all_tickets']);
+        $person = Person::where('u_id', $unit->id)->first();
+
+        Hardware::create([
+            'n_code' => $person->n_code,
+            'pc_name' => 'PC-001',
+            'type' => 'laptop',
+        ]);
+        Ticket::create([
+            'ticket_code' => 'TKT-001',
+            'user_id' => $user->id,
+            'unit_id' => $unit->id,
+            'subject' => 'Test Ticket',
+            'content' => 'x',
+            'priority' => 'normal',
+            'status' => 'created',
+        ]);
+
+        $token = $this->createApiToken($user, $user->getApiTokenAbilities());
+
+        $this->apiGet('/api/gis/hardware?bbox=48,36,49,37', $token)
+            ->assertOk()
+            ->assertJsonPath('features.0.properties.pc_name', 'PC-001')
+            ->assertJsonPath('features.0.properties.person.n_code', $person->n_code);
+
+        $this->apiGet('/api/gis/tickets?bbox=48,36,49,37', $token)
+            ->assertOk()
+            ->assertJsonPath('features.0.properties.title', 'Test Ticket');
+    }
+
+    /**
+     * #1743 Step-3 verdict pin: `/gis/tickets` and `/api/tickets` must return the
+     * same rows for the same caller — `Api\TicketController::index()` has no
+     * permission-based assignment scoping, so GIS must not invent one.
+     *
+     * @test
+     */
+    public function test_gis_tickets_matches_the_tickets_api_scope(): void
+    {
+        ['user' => $user, 'unit' => $unit] = $this->createBBoxUserWith(['map', 'view_assigned_tickets']);
+        $token = $this->createApiToken($user, $user->getApiTokenAbilities());
+
+        foreach (['TKT-A', 'TKT-B'] as $code) {
+            Ticket::create([
+                'ticket_code' => $code,
+                'user_id' => $user->id,
+                'unit_id' => $unit->id,
+                'subject' => $code,
+                'content' => 'x',
+                'priority' => 'normal',
+                'status' => 'created',
+            ]);
+        }
+
+        $gisIds = collect($this->apiGet('/api/gis/tickets?bbox=48,36,49,37', $token)->json('features'))
+            ->pluck('id')->sort()->values()->all();
+        $apiIds = collect($this->apiGet('/api/tickets', $token)->json('data'))
+            ->pluck('id')->sort()->values()->all();
+
+        $this->assertCount(2, $gisIds);
+        $this->assertSame($apiIds, $gisIds);
     }
 
     /** @test */
@@ -343,6 +487,80 @@ class GisApiTest extends TestCase
         $this->assertGreaterThan(0, count($response->json('features')));
     }
 
+    /**
+     * #1805: a zoom the grid maths cannot survive. `-2000` underflows pow() to
+     * 0.0, so `0.5 / 0.0` throws DivisionByZeroError; `-1023` overflows the
+     * quotient to INF, which `sprintf('%f')` writes into the raw SQL. `-5`
+     * returns 200 today — this pins the 0..22 contract instead. `23` pins
+     * `max:22` exactly, and `abc` proves validation runs before the
+     * controller's `(int)` cast.
+     *
+     * @return array<string, array{string}>
+     */
+    public static function invalidZoomSamples(): array
+    {
+        return [
+            'division-by-zero band' => ['-2000'],
+            'INF-in-SQL band' => ['-1023'],
+            'ordinary negative' => ['-5'],
+            'above the Leaflet max' => ['23'],
+            'not an integer' => ['abc'],
+        ];
+    }
+
+    /** @test */
+    #[DataProvider('invalidZoomSamples')]
+    public function test_gis_clusters_rejects_invalid_zoom(string $zoom): void
+    {
+        ['user' => $user] = $this->createBBoxUser();
+        $token = $this->createApiToken($user, ['gis:read']);
+
+        $this->apiGet("/api/gis/clusters?zoom={$zoom}&bbox=48,36,49,37", $token)
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('zoom');
+    }
+
+    /** @test */
+    public function test_gis_clusters_accepts_the_zoom_boundaries(): void
+    {
+        ['user' => $user] = $this->createBBoxUser();
+        $token = $this->createApiToken($user, ['gis:read']);
+
+        foreach ([0, 22] as $zoom) {
+            $this->apiGet("/api/gis/clusters?zoom={$zoom}&bbox=48,36,49,37", $token)
+                ->assertStatus(200)
+                ->assertJsonPath('type', 'FeatureCollection');
+        }
+    }
+
+    /** @test */
+    public function test_gis_clusters_defaults_to_zoom_ten(): void
+    {
+        ['user' => $user] = $this->createBBoxUser();
+        $token = $this->createApiToken($user, ['gis:read']);
+
+        $this->apiGet('/api/gis/clusters?bbox=48,36,49,37', $token)
+            ->assertStatus(200)
+            ->assertJsonPath('type', 'FeatureCollection');
+    }
+
+    /**
+     * #1721 precedent: a rejected request must never reach the cache.
+     *
+     * @test
+     */
+    public function test_invalid_zoom_never_touches_the_cache(): void
+    {
+        ['user' => $user] = $this->createBBoxUser();
+        $token = $this->createApiToken($user, ['gis:read']);
+
+        Cache::spy();
+        Cache::shouldReceive('remember')->never();
+
+        $this->apiGet('/api/gis/clusters?zoom=-2000&bbox=48,36,49,37', $token)
+            ->assertStatus(422);
+    }
+
     /** @test */
     public function test_gis_apis_respect_accessible_units(): void
     {
@@ -414,7 +632,7 @@ class GisApiTest extends TestCase
     #[DataProvider('malformedBboxSamples')]
     public function test_every_gis_endpoint_rejects_a_malformed_bbox(string $bbox): void
     {
-        ['user' => $user] = $this->createBBoxUser();
+        ['user' => $user] = $this->createBBoxUserWith(['map', 'manage_hardware', 'view_all_tickets']);
         $token = $this->createApiToken($user, ['gis:read']);
 
         foreach (['units', 'hardware', 'tickets', 'stats', 'clusters'] as $endpoint) {

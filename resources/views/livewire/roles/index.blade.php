@@ -3,31 +3,43 @@
 use App\Models\User;
 use App\Support\RoleGuard;
 use App\Traits\ClampsPageSize;
+use App\Traits\PersianNormalizer;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Livewire\Component;
 use Livewire\WithPagination;
 use Mary\Traits\Toast;
-use Spatie\Permission\Models\Role;
 use Spatie\Permission\Models\Permission;
+use Spatie\Permission\Models\Role;
+
 return new class extends Component
 {
     use ClampsPageSize;
-    use WithPagination;
+    use PersianNormalizer;
     use Toast;
+    use WithPagination;
 
     // تعریف صریح پروپرتی‌ها با مقدار اولیه
     public string $name = '';
+
     public string $label = '';
-    public int|null $editingId = null;
+
+    public ?int $editingId = null;
+
     public string $search = '';
+
     public int $perPage = 20;
+
     public bool $modal = false;
+
     public array $allPermissions = [];
+
     public array $permissions = [];
+
     public array $sortBy = ['column' => 'id', 'direction' => 'asc'];
 
     // #914: `sortBy` is client-settable, so only real columns are sortable.
     private const SORTABLE_COLUMNS = ['id', 'label', 'name'];
+
     public bool $showHelpModal = false;
 
     // تعریف headers به عنوان پروپرتی برای جلوگیری از خطای Method Not Found
@@ -84,7 +96,18 @@ return new class extends Component
         RoleGuard::assertAdminRoleSurvives($role);
 
         try {
-            $role->delete();
+            // Issue #1823: capture the holders BEFORE the delete — the
+            // `model_has_roles` rows cascade away with the role. Deleting a
+            // role strips its permissions from every holder, so their tokens
+            // must die with it; otherwise the invariant "token abilities =
+            // the holder's current abilities" breaks on delete.
+            $holderIds = $role->users()->pluck('users.id')->all();
+
+            \Illuminate\Support\Facades\DB::transaction(function () use ($role, $holderIds): void {
+                $role->delete();
+                $this->revokeTokensForUserIds($holderIds);
+            });
+
             $this->warning("$role->name حذف شد ", 'با موفقیت', position: 'toast-bottom');
         } catch (\Illuminate\Auth\Access\AuthorizationException $e) {
             // Issue #892: the generic `catch (\Exception $e)` swallowed the
@@ -93,7 +116,7 @@ return new class extends Component
             // 403 stays distinguishable from a foreign-key violation.
             throw $e;
         } catch (\Exception $e) {
-            $this->error("امکان حذف وجود ندارد.", position: 'toast-bottom');
+            $this->error('امکان حذف وجود ندارد.', position: 'toast-bottom');
         }
     }
 
@@ -109,7 +132,7 @@ return new class extends Component
         $this->validate([
             'name' => 'required|string|alpha_num:ascii|max:255|unique:roles,name',
             'label' => 'required|string|max:255|unique:roles,label',
-            'permissions' => 'required'
+            'permissions' => 'required',
         ]);
 
         $newRole = Role::create(['name' => $this->name, 'label' => $this->label]);
@@ -129,7 +152,7 @@ return new class extends Component
         $this->label = $role->label;
 
         // تبدیل IDها به رشته برای سازگاری با x-choices
-        $this->permissions = $role->permissions->pluck('name')->map(fn($name) => (string) $name)->toArray();
+        $this->permissions = $role->permissions->pluck('name')->map(fn ($name) => (string) $name)->toArray();
 
         $this->modal = true;
     }
@@ -139,8 +162,8 @@ return new class extends Component
         $this->authorize('manage_roles');
 
         $this->validate([
-            'name' => 'required|string|alpha_num:ascii|max:255|unique:roles,name,' . $this->editingId,
-            'label' => 'required|string|max:255|unique:roles,label,' . $this->editingId,
+            'name' => 'required|string|alpha_num:ascii|max:255|unique:roles,name,'.$this->editingId,
+            'label' => 'required|string|max:255|unique:roles,label,'.$this->editingId,
             'permissions' => 'required',
         ]);
 
@@ -155,22 +178,59 @@ return new class extends Component
         // locks everyone out exactly like deleting it.
         RoleGuard::assertAdminRoleKeepsItsName($role, $this->name);
 
-        $role->update(['name' => $this->name, 'label' => $this->label]);
-        $role->syncPermissions($this->permissions);
+        // Issue #1823: a role's permission set is the source of its holders'
+        // token abilities. Capture it before the rewrite, plus the holder ids
+        // — the fan-out must stay scoped to THIS role, never org-wide.
+        $permissionsBefore = $role->permissions->pluck('name')->sort()->values()->all();
+        $holderIds = $role->users()->pluck('users.id')->all();
+
+        \Illuminate\Support\Facades\DB::transaction(function () use ($role, $permissionsBefore, $holderIds): void {
+            $role->update(['name' => $this->name, 'label' => $this->label]);
+            $role->syncPermissions($this->permissions);
+
+            $permissionsAfter = $role->permissions()->pluck('name')->sort()->values()->all();
+
+            // A rename-only or label-only edit leaves the set identical and
+            // must not log holders out; any grant or revoke changes it.
+            if ($permissionsAfter !== $permissionsBefore) {
+                $this->revokeTokensForUserIds($holderIds);
+            }
+        });
 
         $this->success("$this->name بروزرسانی شد ", 'با موفقیت', position: 'toast-bottom');
         $this->clear();
     }
 
+    /**
+     * Issue #1823 — revoke the Sanctum tokens of the given user ids.
+     *
+     * Bulk delete (not `each(fn ($u) => $u->tokens()->delete())`) so a role
+     * with many holders costs one query. The morph-type filter keeps the
+     * delete scoped to User tokens, never another tokenable model.
+     *
+     * @param  array<int, int|string>  $userIds
+     */
+    private function revokeTokensForUserIds(array $userIds): void
+    {
+        if ($userIds === []) {
+            return;
+        }
+
+        \Laravel\Sanctum\PersonalAccessToken::query()
+            ->where('tokenable_type', (new User)->getMorphClass())
+            ->whereIn('tokenable_id', $userIds)
+            ->delete();
+    }
+
     public function roles(): LengthAwarePaginator
     {
         $query = Role::query();
-        
-        if (!empty($this->search)) {
-            $query->where('name', 'LIKE', '%' . $this->search . '%')
-                  ->orWhere('label', 'LIKE', '%' . $this->search . '%');
+
+        if (! empty($this->search)) {
+            $query->where('name', 'LIKE', '%'.self::escapeLikeWildcards($this->search).'%')
+                ->orWhere('label', 'LIKE', '%'.self::escapeLikeWildcards($this->search).'%');
         }
-        
+
         $column = in_array($this->sortBy['column'] ?? '', self::SORTABLE_COLUMNS, true)
             ? $this->sortBy['column'] : 'id';
         $direction = ($this->sortBy['direction'] ?? 'asc') === 'desc' ? 'desc' : 'asc';

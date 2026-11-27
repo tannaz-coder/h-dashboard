@@ -2219,6 +2219,73 @@ class TicketsInboxLivewireTest extends TestCase
         $this->assertTrue($todo->fresh()->is_completed);
     }
 
+    public function test_bulk_complete_batches_parent_task_check_across_multiple_todos(): void
+    {
+        // #1831: the parent-task tail is one grouped count + one mass update,
+        // not one count + one update per linked todo. This is the only bulk
+        // case with MULTIPLE todos in one batch, so it is what actually
+        // exercises the grouped query.
+        ['user' => $user] = $this->createUserWithUnit(['view_assigned_tickets', 'manage_unit_tickets']);
+        $this->actingAs($user);
+        $unitId = $user->units()->first()->id;
+
+        $todo = fn (string $title) => Todo::create([
+            'title' => $title,
+            'start_at' => now(),
+            'is_completed' => false,
+            'unit_id' => $unitId,
+        ]);
+
+        // A) every linked ticket completes in this batch → done.
+        $allDone = $todo('همه کامل');
+        // B) keeps an unselected OPEN ticket → must stay incomplete.
+        $partial = $todo('نیمه‌کاره');
+        // C) already closed apart from the one ticket completed right now →
+        //    this is the "no group row means zero open" invariant.
+        $alreadyClosed = $todo('از قبل بسته');
+
+        $mk = fn (Todo $task, string $status = 'accepted') => $this->createTicket([
+            'status' => $status,
+            'current_assignee_id' => $user->id,
+            'task_id' => $task->id,
+        ]);
+
+        $a1 = $mk($allDone);
+        $a2 = $mk($allDone);
+        $b1 = $mk($partial);
+        $b2 = $mk($partial, 'created'); // not selected: stays open
+        $cDone = $mk($alreadyClosed, 'completed');
+        $cNow = $mk($alreadyClosed);
+
+        $component = Livewire::test('tickets.inbox')
+            ->set('selectedTickets', [$a1->id, $a2->id, $b1->id, $cNow->id])
+            ->set('bulkAction', 'complete');
+
+        DB::flushQueryLog();
+        DB::enableQueryLog();
+
+        $component->call('executeBulkAction')->assertDispatched('swal');
+
+        $log = collect(DB::getQueryLog());
+        DB::disableQueryLog();
+
+        // Assert on the database, not the component status.
+        $this->assertTrue($allDone->fresh()->is_completed);
+        $this->assertFalse($partial->fresh()->is_completed);
+        $this->assertTrue($alreadyClosed->fresh()->is_completed);
+        $this->assertSame('completed', $cNow->fresh()->status);
+        $this->assertSame('created', $b2->fresh()->status);
+
+        // Shape of the fix: ONE grouped count for every linked todo and ONE
+        // mass update, however many todos the batch spans.
+        $this->assertSame(1, $log->filter(
+            fn (array $q) => str_starts_with($q['query'], 'select task_id, count(*) as open_count')
+        )->count(), 'Expected exactly one grouped open-ticket count');
+        $this->assertSame(1, $log->filter(
+            fn (array $q) => str_starts_with($q['query'], 'update "todos"')
+        )->count(), 'Expected exactly one mass update of todos');
+    }
+
     public function test_select_all_then_complete_on_pending_tab_processes_nothing(): void
     {
         ['user' => $user] = $this->createUserWithUnit(['view_assigned_tickets', 'manage_unit_tickets']);
@@ -3468,5 +3535,121 @@ class TicketsInboxLivewireTest extends TestCase
             'ticket_id' => $ticket->id,
             'action' => 'forwarded',
         ]);
+    }
+
+    // =====================================================================
+    // #1768 — completion-modal state
+    // =====================================================================
+
+    public function test_cancelling_completion_modal_clears_note_files_and_target(): void
+    {
+        Storage::fake('local');
+
+        ['user' => $user] = $this->createUserWithUnit(['view_assigned_tickets', 'manage_unit_tickets']);
+        $this->actingAs($user);
+
+        $target = $this->createTargetUnit();
+        $a = $this->createTicket(['status' => 'accepted', 'current_assignee_id' => $user->id]);
+        $b = $this->createTicket(['status' => 'accepted', 'current_assignee_id' => $user->id]);
+        $file = UploadedFile::fake()->create('a.pdf', 10, 'application/pdf');
+
+        Livewire::test('tickets.inbox')
+            ->call('openCompletionModal', $a->id)
+            ->assertSeeHtml('wire:click="closeCompletionModal"')
+            ->set('completionNote', 'یادداشت تیکت الف')
+            ->set('completionFiles', [$file])
+            ->set('targetUnitId', $target->id)
+            ->set('targetUnitName', $target->name)
+            ->set('unitSearch', 'مقصد')
+            ->call('closeCompletionModal')
+            ->assertSet('isCompletionModalOpen', false)
+            ->assertSet('completionNote', '')
+            ->assertSet('completionFiles', [])
+            ->assertSet('targetUnitId', null)
+            ->assertSet('targetUnitName', '')
+            ->assertSet('unitSearch', '')
+            ->call('openCompletionModal', $b->id)
+            ->assertSet('isCompletionModalOpen', true)
+            ->assertSet('showingTicketId', $b->id)
+            ->assertSet('completionNote', '')
+            ->assertSet('completionFiles', [])
+            ->assertSet('targetUnitId', null);
+    }
+
+    public function test_client_side_completion_modal_close_resets_its_state(): void
+    {
+        Storage::fake('local');
+
+        ['user' => $user] = $this->createUserWithUnit(['view_assigned_tickets', 'manage_unit_tickets']);
+        $this->actingAs($user);
+
+        $target = $this->createTargetUnit();
+        $ticket = $this->createTicket(['status' => 'accepted', 'current_assignee_id' => $user->id]);
+        $file = UploadedFile::fake()->create('a.pdf', 10, 'application/pdf');
+
+        Livewire::test('tickets.inbox')
+            ->call('openCompletionModal', $ticket->id)
+            ->set('completionNote', 'پیش‌نویس')
+            ->set('completionFiles', [$file])
+            ->set('targetUnitId', $target->id)
+            // CspModal's ✕/backdrop/Escape do exactly this (`$wire.set(...)`).
+            ->set('isCompletionModalOpen', false)
+            ->assertSet('completionNote', '')
+            ->assertSet('completionFiles', [])
+            ->assertSet('targetUnitId', null)
+            ->assertSet('targetUnitName', '')
+            ->assertSet('unitSearch', '');
+    }
+
+    public function test_close_detail_closes_completion_modal_and_submit_without_ticket_toasts(): void
+    {
+        ['user' => $user] = $this->createUserWithUnit(['view_assigned_tickets', 'manage_unit_tickets']);
+        $this->actingAs($user);
+
+        $ticket = $this->createTicket(['status' => 'accepted', 'current_assignee_id' => $user->id]);
+
+        Livewire::test('tickets.inbox')
+            ->call('showTicket', $ticket->id)
+            ->call('openCompletionModal', $ticket->id)
+            ->set('completionNote', 'گزارش نهایی')
+            ->call('closeDetail')
+            ->assertSet('showModal', false)
+            ->assertSet('showingTicketId', null)
+            ->assertSet('isCompletionModalOpen', false)
+            ->assertSet('completionNote', '')
+            // Stale-form submit: must toast, not findOrFail(null) → 404.
+            ->call('submitAction')
+            ->assertDispatched('swal', function ($name, $params) {
+                return ($params[0]['icon'] ?? null) === 'warning';
+            })
+            ->assertSet('isCompletionModalOpen', false);
+
+        $this->assertSame('accepted', $ticket->fresh()->status);
+        $this->assertDatabaseMissing('task_activities', [
+            'ticket_id' => $ticket->id,
+            'action' => 'completed',
+        ]);
+    }
+
+    public function test_cancelling_completion_modal_keeps_an_open_detail_modal_on_its_ticket(): void
+    {
+        ['user' => $user] = $this->createUserWithUnit(['view_assigned_tickets', 'manage_unit_tickets']);
+        $this->actingAs($user);
+
+        $ticket = $this->createTicket([
+            'status' => 'accepted',
+            'current_assignee_id' => $user->id,
+            'content' => 'محتوای یکتای تیکت الف',
+        ]);
+
+        Livewire::test('tickets.inbox')
+            ->call('showTicket', $ticket->id)
+            ->call('openCompletionModal', $ticket->id)
+            ->set('completionNote', 'پیش‌نویس')
+            ->call('closeCompletionModal')
+            ->assertSet('showModal', true)
+            ->assertSet('showingTicketId', $ticket->id)
+            ->assertSet('isCompletionModalOpen', false)
+            ->assertSee('محتوای یکتای تیکت الف');
     }
 }

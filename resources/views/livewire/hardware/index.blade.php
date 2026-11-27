@@ -1,6 +1,5 @@
 <?php
 
-use App\Events\HardwareUpdated;
 use App\Models\Hardware;
 use App\Models\HardwareAudit;
 use App\Models\Person;
@@ -471,6 +470,15 @@ return new class extends Component
             return;
         }
 
+        // #1778: same ceiling as the API. `$selected` is public component
+        // state, so /livewire/update can carry an arbitrarily large array even
+        // though the UI has no select-all.
+        if (count($this->selected) > HardwareRules::MAX_BULK_IDS) {
+            $this->error('حداکثر '.HardwareRules::MAX_BULK_IDS.' دستگاه در یک عملیات گروهی مجاز است.', position: 'toast-bottom');
+
+            return;
+        }
+
         $accessibleIds = $this->accessibleUnitIds();
         // #1026/#1675: load the rows, not just the ids — the pre-update `mark`
         // is the audit diff's `old`, exactly like HardwareController::bulkMark().
@@ -523,13 +531,12 @@ return new class extends Component
         }
 
         // After the commit, synchronously — not inside the transaction and not
-        // via `afterCommit()`: no listener reads uncommitted rows, and
-        // `flushStatsCache()` touches no database.
+        // via `afterCommit()`: `flushStatsCache()` touches no database.
 
-        // #1026/#1675: parity with the API path — listeners on HardwareUpdated
-        // and the stats cache must see a web bulk mark too.
-        app(CacheInvalidationServiceInterface::class)->batch(function () use ($hardwares) {
-            event(new HardwareUpdated($hardwares->first(), 'bulk_mark'));
+        // #1026/#1675: parity with the API path — the stats cache must see a web
+        // bulk mark too. Invalidation is `Hardware::flushStatsCache()`; there is
+        // no event listener.
+        app(CacheInvalidationServiceInterface::class)->batch(function () {
             Hardware::flushStatsCache(); // Issue #376: bulk update bypasses Eloquent events
         });
 
@@ -592,6 +599,14 @@ return new class extends Component
             return;
         }
 
+        // #1778: same ceiling as the API (see bulkMark()) — the selection is
+        // public component state and is not bounded by the UI.
+        if (count($this->selected) > HardwareRules::MAX_BULK_IDS) {
+            $this->error('حداکثر '.HardwareRules::MAX_BULK_IDS.' دستگاه در یک عملیات گروهی مجاز است.', position: 'toast-bottom');
+
+            return;
+        }
+
         $accessibleIds = $this->accessibleUnitIds();
         $hardwares = Hardware::whereIn('id', $this->selected)
             ->whereHas('person', fn ($q) => $q->whereIn('u_id', $accessibleIds))
@@ -635,11 +650,9 @@ return new class extends Component
             request()->attributes->remove('suppress_audit');
         }
 
-        // #1026: parity with the API path — listeners on HardwareUpdated and the
-        // stats cache must see a web bulk delete too. After the commit,
-        // synchronously — see bulkMark().
-        app(CacheInvalidationServiceInterface::class)->batch(function () use ($hardwares) {
-            event(new HardwareUpdated($hardwares->first(), 'bulk_deleted'));
+        // #1026: parity with the API path — the stats cache must see a web bulk
+        // delete too. After the commit, synchronously — see bulkMark().
+        app(CacheInvalidationServiceInterface::class)->batch(function () {
             Hardware::flushStatsCache(); // Issue #376: bulk delete bypasses Eloquent events
         });
 

@@ -2,7 +2,6 @@
 
 namespace App\Http\Controllers\Api;
 
-use App\Events\HardwareUpdated;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\UnitScopedRequest;
 use App\Models\Hardware;
@@ -169,7 +168,6 @@ class HardwareController extends Controller
 
         $hardware = Hardware::create($validated);
         $hardware->load('person.unit');
-        event(new HardwareUpdated($hardware, 'created'));
 
         return response()->json([
             'success' => true,
@@ -205,7 +203,6 @@ class HardwareController extends Controller
 
         $hardware->update($validated);
         $hardware->load('person.unit');
-        event(new HardwareUpdated($hardware, 'updated'));
 
         return response()->json([
             'success' => true,
@@ -218,7 +215,6 @@ class HardwareController extends Controller
         $this->assertAccessible($request, $hardware);
 
         $hardware->delete();
-        event(new HardwareUpdated($hardware, 'deleted'));
 
         return response()->json(['success' => true, 'message' => 'حذف شد']);
     }
@@ -257,6 +253,16 @@ class HardwareController extends Controller
 
     public function bulkMark(UnitScopedRequest $request): JsonResponse
     {
+        // #1778: bound the array BEFORE the per-element rules exist. Laravel
+        // expands `ids.*` into one rule set per element when the validator is
+        // built (ValidationRuleParser::explode -> explodeWildcardRules), so a
+        // lone `max` on `ids` still runs one `exists` query per submitted id
+        // before rejecting the request. Two stages keep an oversized payload
+        // O(1) in queries.
+        $request->validate([
+            'ids' => 'required|array|max:'.HardwareRules::MAX_BULK_IDS,
+        ]);
+
         $validated = $request->validate([
             'ids' => 'required|array',
             'ids.*' => 'integer|exists:hardwares,id',
@@ -322,10 +328,8 @@ class HardwareController extends Controller
         }
 
         // After the commit, synchronously — not inside the transaction and not
-        // via `afterCommit()`: no listener reads uncommitted rows, and
-        // `flushStatsCache()` touches no database.
-        app(CacheInvalidationServiceInterface::class)->batch(function () use ($hardwares) {
-            event(new HardwareUpdated($hardwares->first(), 'bulk_mark'));
+        // via `afterCommit()`: `flushStatsCache()` touches no database.
+        app(CacheInvalidationServiceInterface::class)->batch(function () {
             Hardware::flushStatsCache(); // Issue #376: bulk update bypasses Eloquent events
         });
 
@@ -334,6 +338,11 @@ class HardwareController extends Controller
 
     public function bulkDelete(UnitScopedRequest $request): JsonResponse
     {
+        // #1778: see bulkMark() — size first, element rules second.
+        $request->validate([
+            'ids' => 'required|array|max:'.HardwareRules::MAX_BULK_IDS,
+        ]);
+
         $validated = $request->validate([
             'ids' => 'required|array',
             'ids.*' => 'integer|exists:hardwares,id',
@@ -387,8 +396,7 @@ class HardwareController extends Controller
         }
 
         // After the commit, synchronously — see bulkMark() for why.
-        app(CacheInvalidationServiceInterface::class)->batch(function () use ($hardwares) {
-            event(new HardwareUpdated($hardwares->first(), 'bulk_deleted'));
+        app(CacheInvalidationServiceInterface::class)->batch(function () {
             Hardware::flushStatsCache(); // Issue #376: bulk delete bypasses Eloquent events
         });
 

@@ -210,6 +210,47 @@ class HrApiTest extends TestCase
         $this->assertEquals(1, $response->json('meta.total'));
     }
 
+    // === Issue #1811: malformed list/filter params are 422, not 500 ===
+
+    public function test_personnel_list_rejects_array_search(): void
+    {
+        $token = $this->createApiToken($this->user, ['hr:read']);
+        $response = $this->apiGet('/api/hr/personnel?search[]=x', $token);
+
+        $response->assertStatus(422)
+            ->assertJsonValidationErrors('search');
+    }
+
+    public function test_personnel_list_rejects_non_integer_unit_id(): void
+    {
+        $token = $this->createApiToken($this->user, ['hr:read']);
+        $response = $this->apiGet('/api/hr/personnel?unit_id=abc', $token);
+
+        $response->assertStatus(422)
+            ->assertJsonValidationErrors('unit_id');
+    }
+
+    public function test_personnel_list_rejects_unknown_status(): void
+    {
+        $token = $this->createApiToken($this->user, ['hr:read']);
+        $response = $this->apiGet('/api/hr/personnel?status=foo', $token);
+
+        $response->assertStatus(422)
+            ->assertJsonValidationErrors('status');
+    }
+
+    public function test_personnel_list_accepts_valid_search_and_unit_filter(): void
+    {
+        $person = Person::first();
+        $token = $this->createApiToken($this->user, ['hr:read']);
+        $response = $this->apiGet("/api/hr/personnel?search={$person->n_code}&unit_id={$this->unit->id}", $token);
+
+        $response->assertStatus(200)
+            ->assertJsonStructure(['data', 'meta' => ['total']]);
+        $this->assertEquals(1, $response->json('meta.total'));
+        $this->assertSame($person->n_code, $response->json('data.0.n_code'));
+    }
+
     public function test_personnel_detail_returns_profile(): void
     {
         $token = $this->createApiToken($this->user, ['hr:read']);
@@ -237,10 +278,117 @@ class HrApiTest extends TestCase
         $response->assertStatus(401);
     }
 
+    // === Issue #1802: personnel PII allowlist ===
+
+    /**
+     * The factory sets no PII columns, so a test that relies on setUp's row
+     * would pass on the pre-fix code and pin nothing.
+     */
+    private function setPersonPii(): Person
+    {
+        $person = Person::first();
+        $person->update([
+            'phone' => '09123456789',
+            'birth_date' => '1990-01-01',
+            'hire_date' => '2015-04-01',
+        ]);
+
+        return $person->refresh();
+    }
+
+    public function test_personnel_list_strips_pii_for_dashboard_only_viewer(): void
+    {
+        $person = $this->setPersonPii();
+
+        $token = $this->createApiToken($this->user, ['hr:read']);
+        $response = $this->apiGet('/api/hr/personnel?status=active', $token);
+
+        $response->assertStatus(200)
+            ->assertJsonMissingPath('data.0.phone')
+            ->assertJsonMissingPath('data.0.birth_date')
+            ->assertJsonMissingPath('data.0.hire_date')
+            ->assertJsonMissingPath('data.0.f_name_folded')
+            ->assertJsonMissingPath('data.0.full_name_folded')
+            ->assertJsonPath('data.0.n_code', $person->n_code)
+            ->assertJsonPath('data.0.status', 'active')
+            ->assertJsonPath('data.0.unit.name', 'مرکز بهداشت');
+    }
+
+    public function test_personnel_detail_strips_pii_for_dashboard_only_viewer(): void
+    {
+        $person = $this->setPersonPii();
+
+        $token = $this->createApiToken($this->user, ['hr:read']);
+        $response = $this->apiGet("/api/hr/personnel/{$person->n_code}", $token);
+
+        $response->assertStatus(200)
+            ->assertJsonMissingPath('data.phone')
+            ->assertJsonMissingPath('data.birth_date')
+            ->assertJsonMissingPath('data.hire_date')
+            ->assertJsonMissingPath('data.f_name_folded')
+            ->assertJsonMissingPath('data.full_name_folded')
+            ->assertJsonPath('data.n_code', $person->n_code)
+            ->assertJsonPath('data.status', 'active')
+            ->assertJsonPath('data.unit.name', 'مرکز بهداشت');
+    }
+
+    public function test_personnel_list_returns_pii_for_personnel_manager(): void
+    {
+        $person = $this->setPersonPii();
+        $this->user->givePermissionTo('kargozini');
+
+        $token = $this->createApiToken($this->user, ['hr:read']);
+        $response = $this->apiGet('/api/hr/personnel?status=active', $token);
+
+        $response->assertStatus(200)
+            ->assertJsonPath('data.0.phone', '09123456789');
+
+        $this->assertSame($person->birth_date->toJSON(), $response->json('data.0.birth_date'));
+        $this->assertSame($person->hire_date->toJSON(), $response->json('data.0.hire_date'));
+        $this->assertSame($person->n_code, $response->json('data.0.n_code'));
+    }
+
+    public function test_personnel_detail_returns_pii_for_personnel_manager(): void
+    {
+        $person = $this->setPersonPii();
+        $this->user->givePermissionTo('kargozini');
+
+        $token = $this->createApiToken($this->user, ['hr:read']);
+        $response = $this->apiGet("/api/hr/personnel/{$person->n_code}", $token);
+
+        $response->assertStatus(200)
+            ->assertJsonPath('data.phone', '09123456789');
+
+        $this->assertSame($person->birth_date->toJSON(), $response->json('data.birth_date'));
+        $this->assertSame($person->hire_date->toJSON(), $response->json('data.hire_date'));
+    }
+
+    public function test_personnel_list_and_detail_share_one_shape(): void
+    {
+        $person = $this->setPersonPii();
+
+        $token = $this->createApiToken($this->user, ['hr:read']);
+        $list = $this->apiGet('/api/hr/personnel?status=active', $token);
+        $detail = $this->apiGet("/api/hr/personnel/{$person->n_code}", $token);
+
+        $listKeys = array_keys($list->json('data.0'));
+        $detailKeys = array_keys($detail->json('data'));
+        sort($listKeys);
+        sort($detailKeys);
+
+        $this->assertSame($detailKeys, $listKeys);
+    }
+
     // === Issue #444: Expandable Org Chart ===
 
     public function test_org_chart_expandable_returns_root_units(): void
     {
+        // #1793: the endpoint listed every accessible unit as a top-level root
+        // instead of applying the scope-roots predicate. setUp's scope is
+        // `[unit, child]`, so exactly one row must come back — the parent — and
+        // the in-scope child must not be promoted to a root.
+        $child = Unit::firstWhere('parent_id', $this->unit->id);
+
         $token = $this->createApiToken($this->user, ['hr:read']);
         $response = $this->apiGet('/api/hr/org-chart/expandable', $token);
 
@@ -249,14 +397,83 @@ class HrApiTest extends TestCase
                 'data' => [['id', 'name', 'parent_id', 'personnel_count', 'has_children', 'level']],
                 'meta' => ['initial_limit'],
             ]);
+
+        $ids = collect($response->json('data'))->pluck('id')->all();
+        $this->assertCount(1, $response->json('data'));
+        $this->assertContains($this->unit->id, $ids);
+        $this->assertNotContains($child->id, $ids);
+
+        foreach ($response->json('data') as $row) {
+            $this->assertSame(1, $row['level']);
+            $this->assertTrue(
+                $row['parent_id'] === null || ! in_array($row['parent_id'], [$this->unit->id, $child->id], true),
+                'Every expandable row must be a scope-root.'
+            );
+        }
+    }
+
+    public function test_org_chart_expandable_keeps_a_root_whose_parent_is_out_of_scope(): void
+    {
+        // #1793: the scope-roots predicate has two clauses. A bare
+        // `whereNull('parent_id')` would drop this legitimate root, whose parent
+        // simply sits outside the caller's scope.
+        $outsideParent = Unit::create(['name' => 'والد خارج از دسترس']);
+        $child = Unit::create(['name' => 'فرزند در دسترس', 'parent_id' => $outsideParent->id]);
+        // An in-scope descendant: pre-fix every accessible unit was a root, so
+        // this row exposed the bug; a naive whereNull-only fix would drop the
+        // child itself. Only the two-clause predicate emits exactly the child.
+        Unit::create(['name' => 'نوه در دسترس', 'parent_id' => $child->id]);
+
+        // scope = subtree(child) → parent is out of scope, child must be a root.
+        Session::put('current_unit_id', $child->id);
+
+        $token = $this->createApiToken($this->user, ['hr:read']);
+        $response = $this->apiGet('/api/hr/org-chart/expandable', $token);
+
+        $response->assertStatus(200);
+        $this->assertCount(1, $response->json('data'));
+        $row = collect($response->json('data'))->firstWhere('id', $child->id);
+        $this->assertNotNull($row, 'A child whose parent is out of scope must still be a root.');
+        $this->assertSame($outsideParent->id, $row['parent_id']);
+        $this->assertSame(1, $row['level']);
+    }
+
+    public function test_org_chart_expandable_initial_limit_counts_roots(): void
+    {
+        // #1793: `initial_limit` must count roots, not every accessible unit.
+        // With current_unit_id set the scope is one subtree with exactly one
+        // root, so base units must come from user_units to get several roots.
+        $rootIds = [$this->unit->id];
+        foreach (['ریشه ۱', 'ریشه ۲', 'ریشه ۳'] as $name) {
+            $extra = Unit::create(['name' => $name]);
+            $this->user->units()->attach($extra->id, ['role' => 'staff', 'is_primary' => false]);
+            $rootIds[] = $extra->id;
+        }
+        Session::forget('current_unit_id');
+
+        $token = $this->createApiToken($this->user, ['hr:read']);
+        $response = $this->apiGet('/api/hr/org-chart/expandable?initial_limit=2', $token);
+
+        $response->assertStatus(200);
+        $this->assertCount(2, $response->json('data'));
+        $this->assertSame(2, $response->json('meta.initial_limit'));
+        foreach ($response->json('data') as $row) {
+            $this->assertContains($row['id'], $rootIds);
+            $this->assertNull($row['parent_id']);
+        }
     }
 
     public function test_org_chart_expandable_respects_initial_limit(): void
     {
-        // Create additional root units
-        Unit::create(['name' => 'واحد ۲']);
-        Unit::create(['name' => 'واحد ۳']);
-        Unit::create(['name' => 'واحد ۴']);
+        // #1793: the extra units must be reachable (attached to the user) or
+        // they fall outside the scope and never compete for the limit. With
+        // current_unit_id set the scope has one root, so forget it to expose
+        // every attached unit as a base.
+        foreach (['واحد ۲', 'واحد ۳', 'واحد ۴'] as $name) {
+            $extra = Unit::create(['name' => $name]);
+            $this->user->units()->attach($extra->id, ['role' => 'staff', 'is_primary' => false]);
+        }
+        Session::forget('current_unit_id');
 
         $token = $this->createApiToken($this->user, ['hr:read']);
         $response = $this->apiGet('/api/hr/org-chart/expandable?initial_limit=2', $token);

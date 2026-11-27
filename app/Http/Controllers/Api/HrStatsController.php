@@ -20,6 +20,36 @@ class HrStatsController extends Controller
 {
     use PersianNormalizer;
 
+    /** Columns every `hr:read` + `view_hr_dashboard` caller may see. */
+    private const SUMMARY_COLUMNS = [
+        'id', 'n_code', 'f_name', 'l_name',
+        'u_id', 's_id', 't_id', 'e_id', 'r_id',
+        'status', 'created_at', 'updated_at',
+    ];
+
+    /** Full HR profile columns — only for `kargozini|manage_personnel` readers. */
+    private const PII_COLUMNS = ['phone', 'birth_date', 'hire_date'];
+
+    /**
+     * Issue #1802: `view_hr_dashboard` alone is a dashboard grant, not a
+     * row-level PII grant. An explicit allowlist (rather than a wildcard
+     * select) also keeps new and generated columns out of the payload.
+     *
+     * @return list<string>
+     */
+    private function personColumns(UnitScopedRequest $request): array
+    {
+        $columns = self::SUMMARY_COLUMNS;
+
+        // Fail-closed: canAny() returns false for an unknown permission, so a
+        // deployment missing these permissions leaks no PII.
+        if ($request->user()?->canAny(['kargozini', 'manage_personnel'])) {
+            $columns = array_merge($columns, self::PII_COLUMNS);
+        }
+
+        return $columns;
+    }
+
     /**
      * GET /api/hr/stats — aggregated HR stats.
      */
@@ -107,6 +137,19 @@ class HrStatsController extends Controller
      */
     public function personnel(UnitScopedRequest $request): JsonResponse
     {
+        // Issue #1811: malformed list/filter params must be a 422, never a
+        // 500 from a typed helper or a typed column. Validate before any
+        // query use — the same pattern as PersonController (#1777).
+        $validated = $request->validate([
+            'search' => ['sometimes', 'nullable', 'string'],
+            'unit_id' => ['sometimes', 'nullable', 'integer'],
+            'semat_id' => ['sometimes', 'nullable', 'integer'],
+            'tahsil_id' => ['sometimes', 'nullable', 'integer'],
+            'estekhdam_id' => ['sometimes', 'nullable', 'integer'],
+            'radif_id' => ['sometimes', 'nullable', 'integer'],
+            'status' => ['sometimes', 'nullable', 'in:active,inactive,retired'],
+        ]);
+
         $accessibleIds = $request->accessibleIds();
 
         $query = Person::leftJoin('units', 'persons.u_id', '=', 'units.id')
@@ -115,18 +158,18 @@ class HrStatsController extends Controller
             ->leftJoin('estekhdams', 'persons.e_id', '=', 'estekhdams.id')
             ->leftJoin('radifs', 'persons.r_id', '=', 'radifs.id')
             ->whereIn('persons.u_id', $accessibleIds)
-            ->select(
-                'persons.*',
+            ->select([
+                ...array_map(fn (string $column): string => 'persons.'.$column, $this->personColumns($request)),
                 'units.name as unit_name',
                 'semats.name as semat_name',
                 'tahsils.name as tahsil_name',
                 'estekhdams.name as estekhdam_name',
                 'radifs.name as radif_name',
-            );
+            ]);
 
         $p = 'persons.';
         if ($request->filled('search')) {
-            $s = self::normalizeForQuery($request->search);
+            $s = self::normalizeForQuery((string) $validated['search']);
             $query->where(function ($q) use ($s, $p) {
                 $q->where($p.'n_code', 'LIKE', "%{$s}%")
                     ->orWhere($p.'f_name', 'LIKE', "%{$s}%")
@@ -138,7 +181,7 @@ class HrStatsController extends Controller
         }
         foreach (['unit_id' => 'u_id', 'semat_id' => 's_id', 'tahsil_id' => 't_id', 'estekhdam_id' => 'e_id', 'radif_id' => 'r_id', 'status' => 'status'] as $param => $col) {
             if ($request->filled($param)) {
-                $query->where($p.$col, $request->{$param});
+                $query->where($p.$col, $validated[$param]);
             }
         }
 
@@ -179,13 +222,16 @@ class HrStatsController extends Controller
     }
 
     /**
-     * GET /api/hr/personnel/{n_code} — personnel detail with full HR profile.
+     * GET /api/hr/personnel/{n_code} — personnel detail; PII fields only for
+     * `kargozini|manage_personnel` readers (#1802).
      */
     public function personDetail(UnitScopedRequest $request, string $nCode): JsonResponse
     {
         $accessibleIds = $request->accessibleIds();
 
-        $person = Person::with(['unit:id,name', 'semat:id,name', 'tahsil:id,name', 'estekhdam:id,name', 'radif:id,name'])
+        $person = Person::query()
+            ->select($this->personColumns($request))
+            ->with(['unit:id,name', 'semat:id,name', 'tahsil:id,name', 'estekhdam:id,name', 'radif:id,name'])
             ->where('n_code', $nCode)
             ->first();
 
